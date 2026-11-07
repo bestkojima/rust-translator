@@ -25,6 +25,8 @@ struct Settings {
     provider: String,
     #[serde(default = "default_source_language")]
     source_language: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    models_by_provider: Option<HashMap<String, String>>,
 }
 
 fn legacy_provider() -> String { "siliconflow".into() }
@@ -32,7 +34,7 @@ fn default_source_language() -> String { "en".into() }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: true, excluded_apps: vec!["WindowsTerminal.exe".into(), "cmd.exe".into(), "powershell.exe".into(), "pwsh.exe".into(), "1Password.exe".into(), "KeePass.exe".into()], target_language: "zh".into(), provider: "siliconflow".into(), source_language: default_source_language() }
+        Self { enabled: true, excluded_apps: vec!["WindowsTerminal.exe".into(), "cmd.exe".into(), "powershell.exe".into(), "pwsh.exe".into(), "1Password.exe".into(), "KeePass.exe".into()], target_language: "zh".into(), provider: "siliconflow".into(), source_language: default_source_language(), models_by_provider: None }
     }
 }
 
@@ -43,6 +45,7 @@ struct SettingsResponse {
     target_language: String,
     provider: String,
     source_language: String,
+    model: String,
     has_key: bool,
     credential_error: Option<String>,
     capture_error: Option<String>,
@@ -64,12 +67,29 @@ fn key_entry() -> Result<keyring_core::Entry, String> {
     key_entry_for("siliconflow")
 }
 
-fn key_provider(provider: Option<&str>) -> Result<&str, String> {
-    match provider.unwrap_or("siliconflow") {
-        "siliconflow" => Ok("siliconflow"),
-        "aliyun" => Ok("aliyun"),
-        _ => Err("该翻译服务不使用 API Key".into()),
-    }
+struct Provider { name: &'static str, chat: &'static str, models: &'static str, default_model: &'static str }
+fn provider(id: &str) -> Option<Provider> {
+    let (name, chat, models, default_model) = match id {
+        "siliconflow" => ("硅基流动", "https://api.siliconflow.cn/v1/chat/completions", "https://api.siliconflow.cn/v1/models?sub_type=chat", MODEL),
+        "aliyun" => ("阿里云百炼", ALIYUN_ENDPOINT, "", ALIYUN_MODEL),
+        "deepseek" => ("DeepSeek", "https://api.deepseek.com/chat/completions", "https://api.deepseek.com/models", "deepseek-chat"),
+        "openai" => ("OpenAI", "https://api.openai.com/v1/chat/completions", "https://api.openai.com/v1/models", "gpt-4o-mini"),
+        "openrouter" => ("OpenRouter", "https://openrouter.ai/api/v1/chat/completions", "https://openrouter.ai/api/v1/models", "openai/gpt-4o-mini"),
+        "moonshot" => ("Moonshot", "https://api.moonshot.cn/v1/chat/completions", "https://api.moonshot.cn/v1/models", "moonshot-v1-8k"),
+        "zhipu" => ("智谱", "https://open.bigmodel.cn/api/paas/v4/chat/completions", "", "glm-4-flash"),
+        "gemini" => ("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "https://generativelanguage.googleapis.com/v1beta/models", "gemini-2.5-flash"),
+        "anthropic" => ("Anthropic", "https://api.anthropic.com/v1/messages", "https://api.anthropic.com/v1/models", "claude-sonnet-4-5"),
+        "volcengine" => ("火山方舟", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "https://ark.cn-beijing.volces.com/api/v3/models", "doubao-seed-1-6-flash-250828"),
+        _ => return None,
+    };
+    Some(Provider { name, chat, models, default_model })
+}
+fn selected_model(settings: &Settings, id: &str) -> String {
+    settings.models_by_provider.as_ref().and_then(|m| m.get(id)).cloned().or_else(|| provider(id).map(|p| p.default_model.to_string())).unwrap_or_default()
+}
+fn key_provider(id: Option<&str>) -> Result<&str, String> {
+    let id = id.unwrap_or("siliconflow");
+    if provider(id).is_some() { Ok(id) } else { Err("该翻译服务不使用 API Key".into()) }
 }
 
 fn key_entry_for(provider: &str) -> Result<keyring_core::Entry, String> {
@@ -82,7 +102,7 @@ fn key_entry_for(provider: &str) -> Result<keyring_core::Entry, String> {
 fn get_settings(state: State<'_, AppState>, provider: Option<String>) -> Result<SettingsResponse, String> {
     let settings = state.settings.lock().map_err(|_| "读取设置失败")?.clone();
     let key_provider = provider.as_deref().unwrap_or(&settings.provider);
-    if !["mymemory", "siliconflow", "aliyun"].contains(&key_provider) { return Err("不支持该翻译服务".into()); }
+    if key_provider != "mymemory" && self::provider(key_provider).is_none() { return Err("不支持该翻译服务".into()); }
     let _guard = state.credential_lock.lock().map_err(|_| "读取凭据失败")?;
     let key_status = if key_provider == "mymemory" { Ok(false) } else { key_entry_for(key_provider).and_then(|entry| {
         match entry.get_password() {
@@ -96,22 +116,119 @@ fn get_settings(state: State<'_, AppState>, provider: Option<String>) -> Result<
         Err(error) => (false, Some(error)),
     };
     let capture_error = state.capture_error.lock().map_err(|_| "读取划词状态失败")?.clone();
-    Ok(SettingsResponse { enabled: settings.enabled, excluded_apps: settings.excluded_apps, target_language: settings.target_language, provider: settings.provider, source_language: settings.source_language, has_key, credential_error, capture_error })
+    let model = selected_model(&settings, &settings.provider);
+    Ok(SettingsResponse { model, enabled: settings.enabled, excluded_apps: settings.excluded_apps, target_language: settings.target_language, provider: settings.provider, source_language: settings.source_language, has_key, credential_error, capture_error })
 }
 
 #[tauri::command]
-fn save_settings(app: tauri::AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
+fn save_settings(app: tauri::AppHandle, state: State<'_, AppState>, mut settings: Settings) -> Result<(), String> {
     if !["zh", "en", "ja"].contains(&settings.target_language.as_str()) { return Err("不支持该目标语言".into()); }
     if !["zh", "en", "ja"].contains(&settings.source_language.as_str()) { return Err("不支持该源语言".into()); }
-    if !["mymemory", "siliconflow", "aliyun"].contains(&settings.provider.as_str()) { return Err("不支持该翻译服务".into()); }
+    if settings.provider != "mymemory" && provider(&settings.provider).is_none() { return Err("不支持该翻译服务".into()); }
+    let mut current = state.settings.lock().map_err(|_| "保存设置失败")?;
+    if settings.models_by_provider.is_none() { settings.models_by_provider = current.models_by_provider.clone(); }
     if let Some(dir) = state.config_path.parent() { fs::create_dir_all(dir).map_err(|e| format!("创建设置目录失败：{e}"))?; }
     let data = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
     fs::write(&state.config_path, data).map_err(|e| format!("保存设置失败：{e}"))?;
     capture::set_enabled(settings.enabled);
     capture::set_excluded_apps(settings.excluded_apps.clone());
     if !settings.enabled { if let Some(window) = app.get_webview_window("overlay") { let _ = window.hide(); } }
-    *state.settings.lock().map_err(|_| "保存设置失败")? = settings;
+    *current = settings;
     Ok(())
+}
+
+#[tauri::command]
+fn save_model(state: State<'_, AppState>, provider: String, model: String) -> Result<(), String> {
+    if self::provider(&provider).is_none() { return Err("该服务不支持选择模型".into()); }
+    let model = model.trim();
+    if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) { return Err("请填写有效的模型 ID（最多 256 字符）".into()); }
+    let mut settings = state.settings.lock().map_err(|_| "保存模型失败")?;
+    let mut updated = settings.clone();
+    updated.models_by_provider.get_or_insert_with(HashMap::new).insert(provider, model.to_string());
+    if let Some(dir) = state.config_path.parent() { fs::create_dir_all(dir).map_err(|e| format!("创建设置目录失败：{e}"))?; }
+    fs::write(&state.config_path, serde_json::to_vec_pretty(&updated).map_err(|e| e.to_string())?).map_err(|e| format!("保存设置失败：{e}"))?;
+    *settings = updated;
+    Ok(())
+}
+
+#[tauri::command]
+async fn fetch_models(state: State<'_, AppState>, provider: String, workspace_id: Option<String>) -> Result<Vec<FreeModel>, String> {
+    let spec = self::provider(&provider).ok_or("该服务没有模型列表")?;
+    if provider == "zhipu" { return Err("智谱暂未提供已核实的模型列表接口，请手动填写模型 ID".into()); }
+    // Only the workspace label is variable; the host suffix is fixed to the official region.
+    let endpoint = if provider == "aliyun" {
+        let workspace = workspace_id.as_deref().unwrap_or("").trim();
+        if workspace.is_empty() { return Err("百炼获取模型列表需要工作空间 ID；也可以手动填写模型 ID".into()); }
+        if workspace.len() > 63 || !workspace.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') || workspace.starts_with('-') || workspace.ends_with('-') { return Err("工作空间 ID 格式无效".into()); }
+        format!("https://{workspace}.cn-beijing.maas.aliyuncs.com/api/v1/models")
+    } else { spec.models.to_string() };
+    let key = {
+        let _guard = state.credential_lock.lock().map_err(|_| "读取凭据失败")?;
+        match key_entry_for(&provider)?.get_password() {
+            Ok(key) if !key.is_empty() => key,
+            Ok(_) | Err(keyring_core::Error::NoEntry) => return Err(format!("请先保存{} API Key", spec.name)),
+            Err(e) => return Err(format!("读取凭据失败：{e}")),
+        }
+    };
+    fetch_models_at(&state.aliyun_client, &provider, &endpoint, &key).await
+}
+
+async fn fetch_models_at(client: &reqwest::Client, id: &str, endpoint: &str, key: &str) -> Result<Vec<FreeModel>, String> {
+    let mut results: Vec<FreeModel> = Vec::new();
+    let mut cursor = String::new();
+    let mut page = 1u64;
+    let mut requests = 0u16;
+    loop {
+        requests += 1;
+        if requests > 1000 { return Err("模型列表分页过多，请手动填写模型 ID".into()); }
+        let mut request = client.get(endpoint);
+        request = match id {
+            "anthropic" => request.header("x-api-key", key).header("anthropic-version", "2023-06-01").query(&[("limit", "1000")]),
+            "gemini" => request.header("x-goog-api-key", key).query(&[("pageSize", "1000")]),
+            "aliyun" => request.bearer_auth(key).query(&[("capabilities", "TG"), ("page_size", "100")]).query(&[("page_no", page)]),
+            _ => request.bearer_auth(key),
+        };
+        if !cursor.is_empty() {
+            request = match id { "anthropic" => request.query(&[("after_id", &cursor)]), "gemini" => request.query(&[("pageToken", &cursor)]), _ => request };
+        }
+        let response = request.send().await.map_err(|e| if e.is_timeout() { "获取模型列表超时，请检查网络" } else { "无法连接模型列表服务，请检查网络" }.to_string())?;
+        let status = response.status();
+        if !status.is_success() { return Err(match status.as_u16() {
+            300..=399 => format!("模型列表返回重定向（HTTP {status}），为保护密钥未跟随"),
+            401 | 403 => format!("模型列表认证失败或无访问权限（HTTP {status}），请检查 API Key 和地域"),
+            429 => "模型列表请求过快或额度不足（HTTP 429）".into(),
+            _ => format!("获取模型列表失败（HTTP {status}），可手动填写模型 ID"),
+        }); }
+        let body: serde_json::Value = response.json().await.map_err(|_| "模型列表格式无法识别")?;
+        let data = match id { "aliyun" => body.pointer("/output/models"), "gemini" => body.get("models"), _ => body.get("data") }.and_then(|v| v.as_array()).ok_or("模型列表格式无法识别，可手动填写模型 ID")?;
+        for item in data {
+            if id == "gemini" && !item.get("supportedGenerationMethods").and_then(|v| v.as_array()).map_or(false, |v| v.iter().any(|v| v.as_str() == Some("generateContent"))) { continue; }
+            let model_id = match id { "aliyun" => item.get("model"), "gemini" => item.get("name"), _ => item.get("id") }.and_then(|v| v.as_str());
+            if let Some(model_id) = model_id {
+                let model_id = if id == "gemini" { model_id.strip_prefix("models/").unwrap_or(model_id) } else { model_id };
+                if !model_id.is_empty() && !results.iter().any(|m| m.id == model_id) {
+                    let name = item.get("display_name").or_else(|| item.get("displayName")).or_else(|| if id == "aliyun" { item.get("name") } else { None }).and_then(|v| v.as_str()).unwrap_or(model_id);
+                    results.push(FreeModel { id: model_id.to_string(), name: name.to_string() });
+                }
+            }
+        }
+        let next = match id {
+            "anthropic" if body.get("has_more").and_then(|v| v.as_bool()) == Some(true) => Some(body.get("last_id").and_then(|v| v.as_str()).ok_or("模型列表分页数据无效")?.to_string()),
+            "gemini" => body.get("nextPageToken").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(str::to_string),
+            "aliyun" => {
+                let total = body.pointer("/output/total").and_then(|v| v.as_u64()).ok_or("百炼模型列表缺少分页信息")?;
+                let size = body.pointer("/output/page_size").and_then(|v| v.as_u64()).filter(|v| *v > 0).ok_or("百炼模型列表缺少分页信息")?;
+                let actual_page = body.pointer("/output/page_no").and_then(|v| v.as_u64()).ok_or("百炼模型列表缺少分页信息")?;
+                if actual_page != page { return Err("百炼模型列表分页数据无效".into()); }
+                if page.saturating_mul(size) < total { if data.is_empty() { return Err("百炼模型列表分页数据无效".into()); } page += 1; Some(page.to_string()) } else { None }
+            },
+            _ => None,
+        };
+        match next { Some(next) if next != cursor && page <= 1000 => cursor = next, Some(_) => return Err("模型列表分页异常，请稍后重试".into()), None => break }
+        if results.len() > 100_000 { return Err("模型列表过大，请手动填写模型 ID".into()); }
+    }
+    if results.is_empty() { return Err("模型列表为空，请检查账号权限或手动填写模型 ID".into()); }
+    Ok(results)
 }
 
 #[tauri::command]
@@ -137,31 +254,19 @@ async fn translate_text(state: State<'_, AppState>, text: String) -> Result<Stri
     if settings.provider == "mymemory" {
         return translate_mymemory(&state.client, text, &settings.source_language, &settings.target_language).await;
     }
-    if !["siliconflow", "aliyun"].contains(&settings.provider.as_str()) { return Err("不支持该翻译服务".into()); }
+    let spec = provider(&settings.provider).ok_or("不支持该翻译服务")?;
     let key = {
         let _guard = state.credential_lock.lock().map_err(|_| "读取凭据失败")?;
-        let provider_name = if settings.provider == "aliyun" { "阿里云百炼" } else { "硅基流动" };
         match key_entry_for(&settings.provider)?.get_password() {
-            Ok(key) => key,
-            Err(keyring_core::Error::NoEntry) => return Err(format!("请先在设置中配置{provider_name} API Key")),
-            Err(e) => return Err(format!("读取{provider_name}凭据失败：{e}")),
+            Ok(key) if !key.is_empty() => key,
+            Ok(_) | Err(keyring_core::Error::NoEntry) => return Err(format!("请先在设置中配置{} API Key", spec.name)),
+            Err(e) => return Err(format!("读取{}凭据失败：{e}", spec.name)),
         }
     };
     let language = match settings.target_language.as_str() { "en" => "英文", "ja" => "日文", _ => "中文" };
-    if settings.provider == "aliyun" {
-        return translate_aliyun_at(&state.aliyun_client, ALIYUN_ENDPOINT, &key, text, language).await;
-    }
-    let prompt = format!("把下面的文本翻译成{language}，不要额外解释。\n\n{text}");
-    let response = state.client.post("https://api.siliconflow.cn/v1/chat/completions")
-        .bearer_auth(key)
-        .json(&serde_json::json!({"model":MODEL,"messages":[{"role":"user","content":prompt}],"stream":false,"temperature":0.7,"top_p":0.6,"top_k":20,"max_tokens":2048}))
-        .send().await.map_err(|e| if e.is_timeout() { "翻译超时，请检查网络后重试".to_string() } else { "无法连接翻译服务，请检查网络".to_string() })?;
-    let status = response.status();
-    if !status.is_success() { return Err(match status.as_u16() { 401 | 403 => "API Key 无效或账号没有调用权限".into(), 429 => "请求过于频繁，请稍后再试".into(), _ => format!("翻译服务返回错误（HTTP {status}）") }); }
-    let body: serde_json::Value = response.json().await.map_err(|_| "翻译服务返回了无法识别的数据")?;
-    let result = body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or("").trim();
-    if result.is_empty() { return Err("翻译服务没有返回译文".into()); }
-    Ok(result.to_string())
+    let model = selected_model(&settings, &settings.provider);
+    translate_provider_at(&state.aliyun_client, &settings.provider, spec.chat, &key, &model, text, language).await
+
 }
 
 fn aliyun_http_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -170,30 +275,40 @@ fn aliyun_http_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder().timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build()
 }
 
+#[cfg(test)]
 async fn translate_aliyun_at(client: &reqwest::Client, endpoint: &str, key: &str, text: &str, language: &str) -> Result<String, String> {
+    translate_provider_at(client, "aliyun", endpoint, key, ALIYUN_MODEL, text, language).await
+}
+
+async fn translate_provider_at(client: &reqwest::Client, provider_id: &str, endpoint: &str, key: &str, model: &str, text: &str, language: &str) -> Result<String, String> {
     let prompt = format!("把下面的文本翻译成{language}，只返回译文，不要额外解释。\n\n{text}");
-    let response = client.post(endpoint)
-        .bearer_auth(key)
-        .json(&serde_json::json!({"model":ALIYUN_MODEL,"messages":[{"role":"user","content":prompt}],"enable_thinking":false,"stream":false,"max_tokens":2048}))
-        .send().await.map_err(|e| if e.is_timeout() { "阿里云百炼请求超时，请检查网络后重试".to_string() } else { "无法连接阿里云百炼，请检查网络或代理".to_string() })?;
+    let mut payload = serde_json::json!({"model":model,"messages":[{"role":"user","content":prompt}],"stream":false,"max_tokens":2048});
+    if provider_id == "aliyun" && model.starts_with("deepseek-v") { payload["enable_thinking"] = false.into(); }
+    if provider_id == "siliconflow" && model == MODEL { payload["temperature"] = 0.7.into(); payload["top_p"] = 0.6.into(); payload["top_k"] = 20.into(); }
+    let request = client.post(endpoint);
+    let request = if provider_id == "anthropic" { request.header("x-api-key", key).header("anthropic-version", "2023-06-01") } else { request.bearer_auth(key) };
+    let response = request
+        .json(&payload)
+        .send().await.map_err(|e| if e.is_timeout() { "翻译服务请求超时，请检查网络后重试".to_string() } else { "无法连接翻译服务，请检查网络或代理".to_string() })?;
     let status = response.status();
     if !status.is_success() {
         return Err(match status.as_u16() {
-            300..=399 => format!("阿里云百炼返回重定向（HTTP {status}），为保护密钥未跟随"),
-            400 => "阿里云百炼拒绝了请求（HTTP 400），请检查模型及请求参数".into(),
-            401 => "阿里云百炼认证失败（HTTP 401），请检查北京地域的百炼 API Key".into(),
-            403 => "阿里云百炼拒绝访问（HTTP 403），请检查模型权限和账户额度".into(),
-            404 => "阿里云百炼未找到接口或模型（HTTP 404），请核对模型是否可用".into(),
-            429 => "阿里云百炼请求过快或额度不足（HTTP 429），请查看控制台".into(),
-            _ => format!("阿里云百炼返回错误（HTTP {status}）"),
+            300..=399 => format!("翻译服务返回重定向（HTTP {status}），为保护密钥未跟随"),
+            400 => "翻译服务拒绝了请求（HTTP 400），请检查模型及请求参数".into(),
+            401 => "翻译服务认证失败（HTTP 401），请检查 API Key".into(),
+            403 => "翻译服务拒绝访问（HTTP 403），请检查模型权限和账户额度".into(),
+            404 => "翻译服务未找到接口或模型（HTTP 404），请核对模型是否可用".into(),
+            429 => "翻译服务请求过快或额度不足（HTTP 429），请查看控制台".into(),
+            _ => format!("翻译服务返回错误（HTTP {status}）"),
         });
     }
-    let body: serde_json::Value = response.json().await.map_err(|_| "阿里云百炼返回了无法识别的数据")?;
-    if body.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) == Some("length") {
+    let body: serde_json::Value = response.json().await.map_err(|_| "翻译服务返回了无法识别的数据")?;
+    if body.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) == Some("length") || body.get("stop_reason").and_then(|v| v.as_str()) == Some("max_tokens") {
         return Err("译文被长度限制截断，请缩短原文后重试".into());
     }
-    let result = body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or("").trim();
-    if result.is_empty() { return Err("阿里云百炼没有返回译文，请检查模型权限或重试".into()); }
+    let anthropic_text = body.get("content").and_then(|v| v.as_array()).map(|parts| parts.iter().filter(|p| p.get("type").and_then(|v| v.as_str()) == Some("text")).filter_map(|p| p.get("text").and_then(|v| v.as_str())).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+    let result = if provider_id == "anthropic" { anthropic_text.as_str() } else { body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or("") }.trim();
+    if result.is_empty() { return Err("翻译服务没有返回译文，请检查模型权限或重试".into()); }
     Ok(result.to_string())
 }
 
@@ -238,6 +353,49 @@ mod translation_tests {
         assert_eq!(key_provider(None).unwrap(), "siliconflow");
         assert_eq!(key_provider(Some("aliyun")).unwrap(), "aliyun");
         assert!(key_provider(Some("mymemory")).is_err());
+    }
+
+    #[test]
+    fn model_lists_and_native_translation() {
+        fn serve(bodies: Vec<&'static str>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/models", listener.local_addr().unwrap());
+            let task = std::thread::spawn(move || {
+                bodies.into_iter().map(|body| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut bytes = Vec::new(); let mut buf = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).unwrap(); assert!(n > 0); bytes.extend_from_slice(&buf[..n]);
+                        if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..pos]);
+                            let len = headers.lines().find_map(|l| l.split_once(':').filter(|(n,_)| n.eq_ignore_ascii_case("content-length")).and_then(|(_,v)| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                            if bytes.len() >= pos + 4 + len { break; }
+                        }
+                    }
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                    stream.write_all(response.as_bytes()).unwrap(); String::from_utf8(bytes).unwrap()
+                }).collect()
+            }); (endpoint,task)
+        }
+        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).build().unwrap();
+        let (endpoint, task) = serve(vec![r#"{"data":[{"id":"first","display_name":"First"}],"has_more":true,"last_id":"first"}"#, r#"{"data":[{"id":"second"}],"has_more":false}"#]);
+        let models = tauri::async_runtime::block_on(fetch_models_at(&client,"anthropic",&endpoint,"dummy")).unwrap();
+        assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),vec!["first","second"]);
+        let requests=task.join().unwrap(); assert!(requests[0].to_lowercase().contains("x-api-key: dummy")); assert!(requests[1].contains("after_id=first"));
+        let (endpoint, task) = serve(vec![r#"{"models":[{"name":"models/gemini-test","supportedGenerationMethods":["generateContent"]},{"name":"models/embed","supportedGenerationMethods":["embedContent"]}],"nextPageToken":"next"}"#,r#"{"models":[{"name":"models/gemini-test2","supportedGenerationMethods":["generateContent"]}]}"#]);
+        let models=tauri::async_runtime::block_on(fetch_models_at(&client,"gemini",&endpoint,"dummy")).unwrap();
+        assert_eq!(models.iter().map(|m|m.id.as_str()).collect::<Vec<_>>(),vec!["gemini-test","gemini-test2"]); let requests=task.join().unwrap(); assert!(requests[1].contains("pageToken=next"));
+        let (endpoint, task) = serve(vec![r#"{"output":{"total":2,"page_no":1,"page_size":1,"models":[{"model":"first"}]}}"#,r#"{"output":{"total":2,"page_no":2,"page_size":1,"models":[{"model":"second"}]}}"#]);
+        let models=tauri::async_runtime::block_on(fetch_models_at(&client,"aliyun",&endpoint,"dummy")).unwrap();
+        assert_eq!(models.iter().map(|m|m.id.as_str()).collect::<Vec<_>>(),vec!["first","second"]); let requests=task.join().unwrap(); assert!(requests[1].contains("page_no=2"));
+        let (endpoint, task) = serve(vec![r#"{"content":[{"type":"text","text":"你好"}],"stop_reason":"end_turn"}"#]);
+        let result=tauri::async_runtime::block_on(translate_provider_at(&client,"anthropic",&endpoint,"dummy","chosen-model","Hello","中文")).unwrap();
+        assert_eq!(result,"你好"); let requests=task.join().unwrap(); assert!(requests[0].contains("chosen-model"));
+        let old: Settings = serde_json::from_str(r#"{"enabled":true,"excluded_apps":[],"target_language":"zh"}"#).unwrap();
+        assert_eq!(selected_model(&old,"siliconflow"),MODEL);
+        let mut saved = old; saved.models_by_provider=Some(HashMap::from([("deepseek".into(),"custom-model".into())]));
+        let restored: Settings = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap(); assert_eq!(selected_model(&restored,"deepseek"),"custom-model");
     }
 
     #[test]
@@ -359,7 +517,7 @@ fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> { app.cl
 
 #[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    let allowed = ["https://siliconflow.cn/", "https://cloud.siliconflow.cn/", "https://docs.siliconflow.cn/", "https://help.aliyun.com/", "https://mt.console.aliyun.com/", "https://bailian.console.aliyun.com/", "https://openrouter.ai/", "https://ai.baidu.com/", "https://mymemory.translated.net/"];
+    let allowed = ["https://siliconflow.cn/", "https://cloud.siliconflow.cn/", "https://docs.siliconflow.cn/", "https://help.aliyun.com/", "https://mt.console.aliyun.com/", "https://bailian.console.aliyun.com/", "https://openrouter.ai/", "https://ai.baidu.com/", "https://mymemory.translated.net/", "https://platform.deepseek.com/", "https://platform.openai.com/", "https://open.bigmodel.cn/", "https://platform.moonshot.cn/", "https://platform.kimi.com/", "https://aistudio.google.com/", "https://platform.claude.com/", "https://console.volcengine.com/"];
     if !allowed.iter().any(|base| url.starts_with(base)) { return Err("只能打开列出的官方服务页面".into()); }
     app.opener().open_url(url, None::<&str>).map_err(|e| format!("无法打开浏览器：{e}"))
 }
@@ -466,7 +624,7 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| { if let tauri::WindowEvent::CloseRequested { api, .. } = event { api.prevent_close(); let _ = window.hide(); } })
-        .invoke_handler(tauri::generate_handler![get_settings, save_settings, set_api_key, clear_api_key, translate_text, refresh_free_models, get_pending_selection, copy_text, open_url, show_main, dismiss_overlay, open_translation, translation_ready])
+        .invoke_handler(tauri::generate_handler![get_settings, save_settings, save_model, fetch_models, set_api_key, clear_api_key, translate_text, refresh_free_models, get_pending_selection, copy_text, open_url, show_main, dismiss_overlay, open_translation, translation_ready])
         .run(tauri::generate_context!())
         .expect("启动一划失败");
 }
