@@ -15,6 +15,7 @@ const MODEL: &str = "tencent/Hunyuan-MT-7B";
 const ALIYUN_MODEL: &str = "deepseek-v4.1-flash";
 const ALIYUN_ENDPOINT: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 const SERVICE: &str = "com.wordglance.app";
+const OVERLAY_SIZE: i32 = 20;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
@@ -317,7 +318,7 @@ fn cancel_translation(window: tauri::WebviewWindow, state: State<'_, AppState>, 
 }
 
 #[tauri::command]
-async fn translate_stream(window: tauri::WebviewWindow, state: State<'_, AppState>, text: String, request_id: String) -> Result<String, String> {
+async fn translate_stream(window: tauri::WebviewWindow, state: State<'_, AppState>, text: String, request_id: String, source_language: Option<String>, target_language: Option<String>, expected_provider: Option<String>) -> Result<String, String> {
     let registry_key = stream_key(&window, &request_id)?;
     let mut receiver = {
         let mut registry = state.streams.lock().map_err(|_| "启动翻译失败")?;
@@ -325,10 +326,13 @@ async fn translate_stream(window: tauri::WebviewWindow, state: State<'_, AppStat
     };
     let work = async {
         let settings = state.settings.lock().map_err(|_| "读取设置失败")?.clone();
+        validate_expected_provider(expected_provider.as_deref(), &settings.provider)?;
         let submitted = text.trim();
         validate_translation_text(submitted)?;
+        let (source, target) = resolve_stream_languages(&settings, source_language.as_deref(), target_language.as_deref())?;
         if settings.provider == "mymemory" {
-            return translate_mymemory(&state.client, submitted, &settings.source_language, &settings.target_language).await;
+            // For MyMemory, an omitted source retains the previously configured source language.
+            return translate_mymemory(&state.client, submitted, source.unwrap_or(&settings.source_language), target).await;
         }
         let spec = provider(&settings.provider).ok_or("不支持该翻译服务")?;
         let key = {
@@ -339,9 +343,9 @@ async fn translate_stream(window: tauri::WebviewWindow, state: State<'_, AppStat
                 Err(e) => return Err(format!("读取{}凭据失败：{e}", spec.name)),
             }
         };
-        let language = match settings.target_language.as_str() { "en" => "英文", "ja" => "日文", _ => "中文" };
+        let language = language_name(target);
         let model = selected_model(&settings, &settings.provider);
-        let mut payload = translation_payload(&settings.provider, &model, submitted, language);
+        let mut payload = translation_payload_with_source(&settings.provider, &model, submitted, language, source);
         payload["stream"] = true.into();
         streaming::translate(&state.stream_client, &settings.provider, spec.chat, &key, &payload, |delta| {
             window.emit("translation-chunk", TranslationChunk { request_id: request_id.clone(), delta: delta.to_string() })
@@ -354,6 +358,31 @@ async fn translate_stream(window: tauri::WebviewWindow, state: State<'_, AppStat
     };
     if let Ok(mut registry) = state.streams.lock() { registry.active.remove(&registry_key); }
     result
+}
+
+fn validate_expected_provider(expected: Option<&str>, actual: &str) -> Result<(), String> {
+    if expected.is_some_and(|provider| provider != actual) { return Err("翻译服务已切换，请重试".into()); }
+    Ok(())
+}
+
+fn resolve_stream_languages<'a>(settings: &'a Settings, source: Option<&'a str>, target: Option<&'a str>) -> Result<(Option<&'a str>, &'a str), String> {
+    let target = match target {
+        None => settings.target_language.as_str(),
+        Some(value @ ("zh" | "en" | "ja")) => value,
+        Some(_) => return Err("不支持该目标语言".into()),
+    };
+    let source = match source {
+        None if settings.provider == "mymemory" => Some(settings.source_language.as_str()),
+        None | Some("auto") if settings.provider != "mymemory" => None,
+        Some("auto") => return Err("MyMemory 不支持自动检测，请选择原文语言".into()),
+        Some(value @ ("zh" | "en" | "ja")) => Some(value),
+        _ => return Err("不支持该原文语言".into()),
+    };
+    Ok((source, target))
+}
+
+fn language_name(language: &str) -> &'static str {
+    match language { "en" => "英文", "ja" => "日文", _ => "中文" }
 }
 
 fn validate_translation_text(text: &str) -> Result<(), String> {
@@ -383,6 +412,15 @@ fn translation_payload(provider_id: &str, model: &str, text: &str, language: &st
     let mut payload = serde_json::json!({"model":model,"messages":[{"role":"user","content":prompt}],"stream":false,"max_tokens":2048});
     if provider_id == "aliyun" && model.starts_with("deepseek-v") { payload["enable_thinking"] = false.into(); }
     if provider_id == "siliconflow" && model == MODEL { payload["temperature"] = 0.7.into(); payload["top_p"] = 0.6.into(); payload["top_k"] = 20.into(); }
+    payload
+}
+
+fn translation_payload_with_source(provider_id: &str, model: &str, text: &str, language: &str, source: Option<&str>) -> serde_json::Value {
+    let mut payload = translation_payload(provider_id, model, text, language);
+    if let Some(source) = source {
+        let source_name = language_name(source);
+        payload["messages"][0]["content"] = format!("把下面的{source_name}文本翻译成{language}，只返回译文，不要额外解释。\n\n{text}").into();
+    }
     payload
 }
 
@@ -422,7 +460,7 @@ async fn translate_mymemory(client: &reqwest::Client, text: &str, source: &str, 
 async fn translate_mymemory_at(client: &reqwest::Client, endpoint: &str, text: &str, source: &str, target: &str) -> Result<String, String> {
     if text.len() > 500 { return Err("MyMemory 每次最多 500 个 UTF-8 字节，请缩短选中文字或切换硅基流动".into()); }
     if text.split('\n').any(|line| line.trim().is_empty()) { return Err("MyMemory 每次仅支持一个段落，请缩短选中文字或切换硅基流动".into()); }
-    if source == target { return Err("MyMemory 的源语言与目标语言相同，请在偏好设置中调整".into()); }
+    if source == target { return Err("MyMemory 的原文语言与目标语言相同，请选择不同语言".into()); }
     let to_code = |lang: &str| match lang { "zh" => "zh-CN", "ja" => "ja", _ => "en" };
     let pair = format!("{}|{}", to_code(source), to_code(target));
     let response = client.get(endpoint)
@@ -475,6 +513,44 @@ mod translation_tests {
         assert_eq!(specialized["messages"].as_array().unwrap().len(), 1);
         assert_eq!(specialized["messages"][0]["content"], format!("把下面的文本翻译成日文，只返回译文，不要额外解释。\n\n{source}"));
         assert_eq!(specialized["temperature"], 0.7);
+    }
+
+    #[test]
+    fn stream_language_overrides_are_per_request_and_preserve_legacy_defaults() {
+        let mut settings = Settings::default();
+        settings.source_language = "ja".into();
+        settings.target_language = "en".into();
+        assert_eq!(resolve_stream_languages(&settings, None, None).unwrap(), (None, "en"));
+        assert_eq!(resolve_stream_languages(&settings, Some("auto"), Some("zh")).unwrap(), (None, "zh"));
+        for code in ["en", "zh", "ja"] {
+            assert_eq!(resolve_stream_languages(&settings, Some(code), Some(code)).unwrap(), (Some(code), code));
+        }
+        assert!(resolve_stream_languages(&settings, Some("fr"), None).is_err());
+        assert!(resolve_stream_languages(&settings, None, Some("")).is_err());
+        assert_eq!(settings.source_language, "ja");
+        assert_eq!(settings.target_language, "en");
+
+        let auto = translation_payload_with_source("siliconflow", MODEL, "Hello", "中文", None);
+        assert_eq!(auto, translation_payload("siliconflow", MODEL, "Hello", "中文"));
+        let explicit = translation_payload_with_source("siliconflow", MODEL, "Hello", "日文", Some("en"));
+        assert_eq!(explicit["messages"][0]["content"], "把下面的英文文本翻译成日文，只返回译文，不要额外解释。\n\nHello");
+        assert_eq!(explicit["temperature"], 0.7);
+
+        settings.provider = "mymemory".into();
+        assert_eq!(resolve_stream_languages(&settings, None, None).unwrap(), (Some("ja"), "en"));
+        assert_eq!(resolve_stream_languages(&settings, Some("en"), Some("zh")).unwrap(), (Some("en"), "zh"));
+        assert!(resolve_stream_languages(&settings, Some("auto"), None).unwrap_err().contains("不支持自动"));
+        assert!(resolve_stream_languages(&settings, Some("fr"), None).is_err());
+        let error = tauri::async_runtime::block_on(translate_mymemory_at(&reqwest::Client::new(), "http://127.0.0.1:1", "hello", "en", "en")).unwrap_err();
+        assert!(error.contains("原文语言与目标语言相同"));
+    }
+
+    #[test]
+    fn stream_provider_snapshot_prevents_sending_to_a_different_service() {
+        assert!(validate_expected_provider(None, "siliconflow").is_ok());
+        assert!(validate_expected_provider(Some("siliconflow"), "siliconflow").is_ok());
+        assert_eq!(validate_expected_provider(Some("siliconflow"), "mymemory").unwrap_err(), "翻译服务已切换，请重试");
+        assert!(validate_expected_provider(Some(""), "siliconflow").is_err());
     }
 
     #[test]
@@ -730,7 +806,7 @@ fn clamp_to_work_area(target: (i32, i32), logical_size: (i32, i32), origin: (i32
 
 #[cfg(test)]
 mod placement_tests {
-    use super::{clamp_to_work_area, contains_point};
+    use super::{clamp_to_work_area, contains_point, OVERLAY_SIZE};
 
     #[test]
     fn anchor_on_edge_keeps_offset_icon_within_work_area() {
@@ -738,7 +814,7 @@ mod placement_tests {
         assert!(contains_point((0, 0), (1920, 1080), anchor));
         let target = (anchor.0 + 12, anchor.1 + 12);
         assert!(!contains_point((0, 0), (1920, 1080), target));
-        assert_eq!(clamp_to_work_area(target, (48, 48), (0, 0), (1920, 1040), 1.0), (1872, 992));
+        assert_eq!(clamp_to_work_area(target, (OVERLAY_SIZE, OVERLAY_SIZE), (0, 0), (1920, 1040), 1.0), (1900, 1020));
     }
 
     #[test]
@@ -746,7 +822,7 @@ mod placement_tests {
         let anchor = (-2, 500);
         assert!(contains_point((-1920, 0), (1920, 1080), anchor));
         assert!(!contains_point((0, 0), (1920, 1080), anchor));
-        assert_eq!(clamp_to_work_area((anchor.0 + 12, anchor.1 + 12), (48, 48), (-1920, 0), (1920, 1040), 1.5), (-72, 512));
+        assert_eq!(clamp_to_work_area((anchor.0 + 12, anchor.1 + 12), (OVERLAY_SIZE, OVERLAY_SIZE), (-1920, 0), (1920, 1040), 1.5), (-30, 512));
     }
 }
 
@@ -770,7 +846,7 @@ fn main() {
             app.manage(AppState { settings: Mutex::new(settings), pending: Mutex::new(String::new()), credential_lock: Mutex::new(()), capture_error: Mutex::new(None), translation_ready: AtomicBool::new(false), translation_pending: AtomicBool::new(false), client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?, aliyun_client: aliyun_http_client()?, stream_client: stream_http_client()?, config_path, streams: Mutex::new(StreamRegistry::default()) });
 
             WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("index.html?window=overlay".into()))
-                .title("一划").inner_size(48.0, 48.0).decorations(false).transparent(true).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).focused(false).build()?;
+                .title("一划").inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64).decorations(false).transparent(true).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).focused(false).build()?;
             WebviewWindowBuilder::new(app, "translation", WebviewUrl::App("index.html?window=translation".into()))
                 .title("一划翻译").inner_size(420.0, 350.0).decorations(false).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).build()?;
             let show = MenuItem::with_id(app, "show", "打开一划", true, None::<&str>)?;
@@ -788,7 +864,7 @@ fn main() {
                         let state = handle.state::<AppState>();
                         if let Ok(mut pending) = state.pending.lock() { *pending = selection.text; }
                         if let Some(window) = handle.get_webview_window("overlay") {
-                            let (x, y) = clamp_position(&window, (selection.x, selection.y), (selection.x + 12, selection.y + 12), (48, 48));
+                            let (x, y) = clamp_position(&window, (selection.x, selection.y), (selection.x + 12, selection.y + 12), (OVERLAY_SIZE, OVERLAY_SIZE));
                             let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
                             let _ = window.show();
                         }
