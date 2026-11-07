@@ -6,6 +6,8 @@ type Provider = 'mymemory' | 'siliconflow' | 'aliyun' | 'deepseek' | 'openrouter
 type Settings = { enabled: boolean; excluded_apps: string[]; has_key: boolean; provider: Provider; model: string; source_language: string; target_language: string; capture_error?: string | null; credential_error?: string | null };
 type FreeModel = { id: string; name: string };
 type SelectionEvent = { text?: string };
+type StreamChunk = { request_id: string; delta: string };
+type StreamRequest = { id: string; cancelled: boolean; started: boolean; unlisten?: () => void };
 type Page = 'translate' | 'discover' | 'settings';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -66,6 +68,14 @@ let modelStatus = '';
 let modelStatusError = false;
 let modelLoading = false;
 let workspaceId = '';
+let streamSerial = 0;
+let manualRequest: StreamRequest | undefined;
+let selectionRequest: StreamRequest | undefined;
+let selectionRunning = false;
+let manualDraft = '';
+let manualResult = '';
+let manualStatus = '';
+let manualWorking = false;
 const escapeHtml = (value: unknown) => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[c]!));
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : typeof error === 'string' ? error : '操作失败，请稍后重试';
 
@@ -75,6 +85,48 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
   if (command === 'get_settings') return { enabled: true, excluded_apps: [], has_key: false, provider: 'siliconflow', model: 'tencent/Hunyuan-MT-7B', source_language: 'en', target_language: 'zh' } as T;
   if (command === 'open_url') { window.open(String(args?.url), '_blank', 'noopener,noreferrer'); return undefined as T; }
   throw new Error('浏览器预览模式：请在桌面应用中使用此功能');
+}
+function newStreamRequest(): StreamRequest {
+  return { id: `${windowKind}-${Date.now().toString(36)}-${(++streamSerial).toString(36)}`, cancelled: false, started: false };
+}
+function cancelStream(request: StreamRequest | undefined) {
+  if (!request || request.cancelled) return;
+  request.cancelled = true;
+  request.unlisten?.(); request.unlisten = undefined;
+  if (request.started) void call('cancel_translation', { requestId: request.id }).catch(() => {});
+}
+async function runStream(text: string, request: StreamRequest, onChunk: (delta: string) => void): Promise<string | undefined> {
+  if (!isTauri) throw new Error('浏览器预览模式：请在桌面应用中使用此功能');
+  request.unlisten = await listen<StreamChunk>('translation-chunk', event => {
+    if (!request.cancelled && event.payload.request_id === request.id) onChunk(event.payload.delta);
+  });
+  if (request.cancelled) { request.unlisten(); request.unlisten = undefined; return; }
+  try {
+    request.started = true;
+    return await call<string>('translate_stream', { text, requestId: request.id });
+  } finally {
+    request.unlisten?.(); request.unlisten = undefined;
+  }
+}
+function stopManual() {
+  if (!manualRequest) return;
+  cancelStream(manualRequest); manualRequest = undefined; manualWorking = false;
+  manualStatus = '已停止翻译';
+}
+function stopSelection(showStatus = false) {
+  selectionGeneration++;
+  cancelStream(selectionRequest); selectionRequest = undefined;
+  if (showStatus && selectionRunning) {
+    const result = document.querySelector<HTMLDivElement>('#translation-result');
+    const status = document.querySelector<HTMLParagraphElement>('#translation-status');
+    const progress = document.querySelector<HTMLSpanElement>('#translation-progress');
+    const retry = document.querySelector<HTMLButtonElement>('#retry-result');
+    if (progress) progress.textContent = '';
+    if (lastResult && status) { status.hidden = false; status.textContent = '已停止翻译，以上为部分译文。'; }
+    else if (result) result.textContent = '已停止翻译';
+    if (retry) retry.hidden = !lastSource;
+  }
+  selectionRunning = false;
 }
 function notify(message: string, kind: 'success' | 'error' = 'success') {
   const toast = document.querySelector<HTMLElement>('#toast');
@@ -119,7 +171,7 @@ function mainPage() {
   ${captureWarning()}<section class="hero" aria-label="划词翻译使用方法"><div class="hero-copy"><div class="hero-kicker"><span class="mini-spark">✳</span> 简单三步</div><h2>让语言的距离，<br>只有<span>一划。</span></h2><p>在浏览器或文档中选中文字，点击出现的图标，即可查看翻译。</p><button class="text-link light-link" data-action="to-settings">管理划词设置 ${icons.arrow}</button></div><div class="hero-art" aria-hidden="true"><div class="paper-line short"></div><div class="paper-line"></div><div class="sample-selection">A little curiosity goes a long way.<span class="sample-bubble">${icons.translate}</span></div><div class="paper-line medium"></div><div class="sample-card"><span>中</span><div><small>译文</small><strong>一点好奇心，可以走很远。</strong></div></div><div class="hero-star one">✳</div><div class="hero-star two">✳</div></div></section>
   <div class="section-top"><div><span class="section-kicker">READY WHEN YOU ARE</span><h2>配置翻译服务</h2></div><button class="text-link" data-action="to-discover">寻找免费接口 ${icons.arrow}</button></div>
   <section class="provider-card">${providerPicker()}${providerDetails()}</section>
-  <section class="manual"><div><span class="section-kicker">PASTE & TRANSLATE</span><h2>手动翻译</h2><p>遇到无法划词的应用，可以在这里粘贴文字。</p></div><label class="sr-only" for="manual-text">输入需要翻译的文字</label><textarea id="manual-text" rows="3" placeholder="在这里粘贴或输入文字…"></textarea><div class="manual-actions"><span>内容仅在点击翻译后发送</span><button class="button primary" data-action="manual-translate">翻译文字 ${icons.arrow}</button></div><div id="manual-result" class="manual-result" hidden></div></section>`;
+  <section class="manual"><div><span class="section-kicker">PASTE & TRANSLATE</span><h2>手动翻译</h2><p>遇到无法划词的应用，可以在这里粘贴文字。</p></div><label class="sr-only" for="manual-text">输入需要翻译的文字</label><textarea id="manual-text" rows="3" placeholder="在这里粘贴或输入文字…">${escapeHtml(manualDraft)}</textarea><div class="manual-actions"><span>内容仅在点击翻译后发送</span><button class="button primary" data-action="${manualWorking ? 'manual-stop' : 'manual-translate'}">${manualWorking ? '停止翻译' : `翻译文字 ${icons.arrow}`}</button></div><div id="manual-result" class="manual-result" ${manualResult || manualWorking ? '' : 'hidden'}>${escapeHtml(manualResult || (manualWorking ? '正在翻译…' : ''))}</div><p id="manual-status" class="error small" role="status" ${manualStatus ? '' : 'hidden'}>${escapeHtml(manualStatus)}</p></section>`;
 }
 function discoverPage() {
   return `<div class="page-head"><div><div class="eyebrow">FIND YOUR API</div><h1>好用的接口，<span>慢慢找。</span></h1><p class="lead">从官方入口开始，找适合自己的免费翻译服务。</p></div><span class="top-status">资料核对于 2026.11.07</span></div><div class="info-band"><span>✳</span><p><strong>免费政策会变。</strong>使用前请核对服务商的最新价格和账户额度；应用不会自动切换到收费模型。</p></div><div class="catalog-head"><div><span class="section-kicker">THE SHORTLIST</span><h2>精选入口</h2></div><span class="muted small">官方资料 · 非实时价格</span></div>
@@ -138,6 +190,7 @@ function settingsPage() {
   return `<div class="page-head"><div><div class="eyebrow">MAKE IT YOURS</div><h1>安静地，<span>刚刚好。</span></h1><p class="lead">把划词体验调整成适合你的样子。</p></div><span class="top-status">${statusMarkup()}</span></div>${captureWarning()}<section class="settings-card"><div class="setting-row"><div><h3>自动划词</h3><p>选中文字后显示翻译图标。暂停后仍可手动翻译。</p></div><label class="switch"><input type="checkbox" id="enabled" ${settings.enabled ? 'checked' : ''}/><span></span><span class="sr-only">开启自动划词</span></label></div><div class="setting-row column"><div><h3>排除应用</h3><p>在不希望显示图标的程序中暂停划词，每行一个程序名，例如 <code>Code.exe</code>。</p></div><label class="sr-only" for="excluded-apps">排除应用，每行一个</label><textarea id="excluded-apps" rows="4" placeholder="例如：&#10;WindowsTerminal.exe&#10;KeePass.exe">${escapeHtml(settings.excluded_apps.join('\n'))}</textarea></div><div class="setting-row column"><div><h3>原文语言</h3><p>MyMemory 使用所选原文语言；大模型会根据文本识别语言。</p></div><label class="sr-only" for="source-language">原文语言</label><select id="source-language">${options(settings.source_language)}</select></div><div class="setting-row column"><div><h3>目标语言</h3><p>选择翻译结果使用的语言；使用 MyMemory 时请与原文语言选不同的语言。</p></div><label class="sr-only" for="target-language">目标语言</label><select id="target-language">${options(settings.target_language)}</select></div><div class="settings-actions"><button class="button primary" data-action="save-settings">保存设置</button></div></section><div class="privacy-note"><span>✳</span><div><strong>你的选择，你来决定。</strong><p>应用会在本机读取选中文本以显示图标；点击翻译时，原文才会发送到已配置的翻译服务。</p></div></div>`;
 }
 function renderMain() {
+  stopManual();
   app.innerHTML = `<div class="app-shell">${navigation()}<main class="main-content"><div class="main-inner">${page === 'translate' ? mainPage() : page === 'discover' ? discoverPage() : settingsPage()}</div><footer class="footer"><span>读得专注，想得更远。</span><span>YIHUA / 一划</span></footer></main></div><div id="toast" class="toast" role="status" aria-live="polite"></div>${!isTauri ? '<div class="preview-badge">浏览器预览</div>' : ''}`;
 }
 function go(next: Page) { page = next; renderMain(); document.querySelector('.main-content')?.scrollTo(0, 0); }
@@ -206,14 +259,33 @@ async function saveSettings() {
   await call('save_settings', { settings: { enabled, excluded_apps, source_language, target_language, provider: settings.provider } });
   try { settings = await call<Settings>('get_settings'); loadError = ''; } catch (error) { settings = { ...settings, enabled, excluded_apps, source_language, target_language }; loadError = `设置已保存，但无法读取应用状态：${errorMessage(error)}`; } renderMain(); notify(loadError || '设置已保存', loadError ? 'error' : 'success');
 }
-async function manualTranslate(button: HTMLButtonElement) {
-  const text = requireElement<HTMLTextAreaElement>('#manual-text').value.trim();
-  if (!text) { notify('请输入要翻译的文字', 'error'); return; }
-  const result = requireElement<HTMLDivElement>('#manual-result'); result.hidden = false; result.classList.remove('error'); result.textContent = '正在翻译…';
-  button.disabled = true;
-  try { const translated = await call<string>('translate_text', { text }); result.textContent = translated; }
-  catch (error) { result.textContent = errorMessage(error); result.classList.add('error'); }
-  finally { button.disabled = false; }
+function updateManualView() {
+  const result = document.querySelector<HTMLDivElement>('#manual-result');
+  const status = document.querySelector<HTMLParagraphElement>('#manual-status');
+  const button = document.querySelector<HTMLButtonElement>('[data-action=manual-translate], [data-action=manual-stop]');
+  if (result) { result.hidden = !manualResult && !manualWorking; result.textContent = manualResult || (manualWorking ? '正在翻译…' : ''); }
+  if (status) { status.hidden = !manualStatus; status.textContent = manualStatus; }
+  if (button) { button.dataset.action = manualWorking ? 'manual-stop' : 'manual-translate'; button.innerHTML = manualWorking ? '停止翻译' : `翻译文字 ${icons.arrow}`; }
+}
+async function manualTranslate() {
+  const text = requireElement<HTMLTextAreaElement>('#manual-text').value;
+  if (!text.trim()) { notify('请输入要翻译的文字', 'error'); return; }
+  stopManual();
+  const request = newStreamRequest(); manualRequest = request;
+  manualDraft = text; manualResult = ''; manualStatus = ''; manualWorking = true; updateManualView();
+  try {
+    const translated = await runStream(text, request, delta => {
+      if (manualRequest !== request) return;
+      manualResult += delta; updateManualView();
+    });
+    if (manualRequest !== request || request.cancelled) return;
+    manualResult = translated || ''; manualStatus = '';
+  } catch (error) {
+    if (manualRequest !== request || request.cancelled) return;
+    manualStatus = `${manualResult ? '翻译中断，以上为已收到的部分译文：' : '翻译失败：'}${errorMessage(error)}`;
+  } finally {
+    if (manualRequest === request) { manualRequest = undefined; manualWorking = false; updateManualView(); }
+  }
 }
 async function refreshModels(button: HTMLButtonElement) {
   const list = requireElement<HTMLDivElement>('#model-list'); button.disabled = true; list.innerHTML = '<p class="muted small">正在获取 OpenRouter 免费模型…</p>';
@@ -241,7 +313,8 @@ async function handleMainClick(event: Event) {
       case 'save-model': await saveProviderModel(button); break;
       case 'fetch-provider-models': await fetchProviderModels(button); break;
       case 'save-settings': await saveSettings(); break;
-      case 'manual-translate': await manualTranslate(button); break;
+      case 'manual-translate': await manualTranslate(); break;
+      case 'manual-stop': stopManual(); updateManualView(); break;
       case 'refresh-models': await refreshModels(button); break;
     }
   } catch (error) { notify(errorMessage(error), 'error'); }
@@ -254,23 +327,26 @@ function renderOverlay() {
 }
 function renderTranslation() {
   document.body.className = 'translation-body';
-  app.innerHTML = `<div class="translation-window"><header class="translation-header"><div class="translation-brand"><span class="translation-mark">${icons.spark}</span><strong>一划</strong><span class="translation-caption">选中即达</span></div><div class="translation-header-actions"><button class="icon-button" id="open-main" title="打开设置" aria-label="打开设置">${icons.settings}</button><button class="icon-button" id="close-translation" title="关闭" aria-label="关闭">${icons.close}</button></div></header><div class="translation-content"><div class="translation-label"><span>原文</span><span id="source-length"></span></div><p class="source-text" id="source-text">等待选中文字</p><div class="translation-divider"><span>${icons.translate}</span></div><div class="translation-label"><span>译文</span><span id="translation-provider"></span></div><div id="translation-result" class="translation-result" aria-live="polite">等待翻译</div></div><footer class="translation-footer"><span>原文发送至所选服务商</span><div class="translation-actions"><button class="copy-action" id="retry-result" hidden>重试</button><button class="copy-action" id="copy-result" disabled>${icons.copy}<span>复制译文</span></button></div></footer></div><div id="toast" class="toast" role="status"></div>`;
-  document.querySelector('#close-translation')?.addEventListener('click', () => { void call('dismiss_overlay').catch(error => notify(errorMessage(error), 'error')); });
+  app.innerHTML = `<div class="translation-window"><header class="translation-header"><div class="translation-brand"><span class="translation-mark">${icons.spark}</span><strong>一划</strong><span class="translation-caption">选中即达</span></div><div class="translation-header-actions"><button class="icon-button" id="open-main" title="打开设置" aria-label="打开设置">${icons.settings}</button><button class="icon-button" id="close-translation" title="关闭" aria-label="关闭">${icons.close}</button></div></header><div class="translation-content"><div class="translation-label"><span>原文</span><span id="source-length"></span></div><p class="source-text" id="source-text">等待选中文字</p><div class="translation-divider"><span>${icons.translate}</span></div><div class="translation-label"><span>译文</span><span><span id="translation-provider"></span><span id="translation-progress"></span></span></div><div id="translation-result" class="translation-result" aria-live="polite">等待翻译</div><p id="translation-status" class="error small" role="status" hidden></p></div><footer class="translation-footer"><span>原文发送至所选服务商</span><div class="translation-actions"><button class="copy-action" id="retry-result" hidden>重试</button><button class="copy-action" id="copy-result" disabled>${icons.copy}<span>复制译文</span></button></div></footer></div><div id="toast" class="toast" role="status"></div>`;
+  const closeTranslation = () => { stopSelection(true); void call('dismiss_overlay').catch(error => notify(errorMessage(error), 'error')); };
+  document.querySelector('#close-translation')?.addEventListener('click', closeTranslation);
   document.querySelector('#open-main')?.addEventListener('click', () => { void call('show_main').catch(error => notify(errorMessage(error), 'error')); });
   document.querySelector('#copy-result')?.addEventListener('click', () => { void call('copy_text', { text: lastResult }).then(() => notify('译文已复制')).catch(error => notify(errorMessage(error), 'error')); });
   document.querySelector('#retry-result')?.addEventListener('click', () => { void translateSelection(true); });
-  document.addEventListener('keydown', event => { if (event.key === 'Escape') void call('dismiss_overlay').catch(error => notify(errorMessage(error), 'error')); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') closeTranslation(); });
 }
 async function translateSelection(retry = false) {
-  const generation = ++selectionGeneration; lastResult = '';
+  stopSelection(); const generation = selectionGeneration; selectionRunning = true; lastResult = '';
   if (!retry) lastSource = '';
   const source = requireElement<HTMLParagraphElement>('#source-text');
   const length = requireElement<HTMLSpanElement>('#source-length');
   const result = requireElement<HTMLDivElement>('#translation-result');
+  const status = requireElement<HTMLParagraphElement>('#translation-status');
   const copy = requireElement<HTMLButtonElement>('#copy-result');
   const retryButton = requireElement<HTMLButtonElement>('#retry-result');
   const provider = requireElement<HTMLSpanElement>('#translation-provider');
-  retryButton.hidden = true; provider.textContent = '';
+  const progress = requireElement<HTMLSpanElement>('#translation-progress');
+  retryButton.hidden = true; provider.textContent = ''; progress.textContent = '生成中…'; status.hidden = true; status.textContent = '';
   copy.disabled = true; source.textContent = '正在获取选中文字…'; length.textContent = '';
   result.innerHTML = '<span class="loading-dots"><i></i><i></i><i></i></span> 正在翻译'; result.classList.remove('error');
   try {
@@ -279,15 +355,23 @@ async function translateSelection(retry = false) {
     if (!text.trim()) throw new Error('没有获取到选中文字，请重新选择。');
     lastSource = text;
     source.textContent = text; length.textContent = `${text.length} 字符`;
-    try { const current = await call<Settings>('get_settings'); provider.textContent = current.provider === 'mymemory' ? '由 MyMemory 提供' : `由 ${cloudProviders[current.provider as CloudProvider]?.name || current.provider} 提供`; } catch { provider.textContent = ''; }
+    try { const current = await call<Settings>('get_settings'); provider.textContent = current.provider === 'mymemory' ? '由 MyMemory 提供' : `由 ${cloudProviders[current.provider as CloudProvider]?.name || current.provider} 提供`; progress.textContent = ' · 生成中…'; } catch { provider.textContent = ''; }
     if (generation !== selectionGeneration) return;
-    const translated = await call<string>('translate_text', { text });
-    if (generation !== selectionGeneration) return;
+    const request = newStreamRequest(); selectionRequest = request;
+    const translated = await runStream(text, request, delta => {
+      if (generation !== selectionGeneration || selectionRequest !== request) return;
+      lastResult += delta; result.textContent = lastResult; copy.disabled = !lastResult;
+    });
+    if (generation !== selectionGeneration || selectionRequest !== request || request.cancelled) return;
+    selectionRequest = undefined; selectionRunning = false; progress.textContent = '';
+    if (translated === undefined) return;
     lastResult = translated; result.textContent = translated; copy.disabled = false;
   } catch (error) {
     if (generation !== selectionGeneration) return;
+    selectionRequest = undefined; selectionRunning = false; progress.textContent = '';
     if (source.textContent === '正在获取选中文字…') source.textContent = '未获取到文字';
-    result.textContent = errorMessage(error); result.classList.add('error');
+    if (lastResult) { status.hidden = false; status.textContent = `翻译中断，以上为部分译文：${errorMessage(error)}`; }
+    else { result.textContent = errorMessage(error); result.classList.add('error'); }
     retryButton.hidden = !lastSource;
   }
 }
@@ -295,19 +379,21 @@ async function bootstrap() {
   if (windowKind === 'overlay') { renderOverlay(); return; }
   if (windowKind === 'translation') {
     renderTranslation();
+    document.addEventListener('visibilitychange', () => { if (document.hidden) stopSelection(true); });
     if (isTauri) { try { await listen<SelectionEvent>('selection', () => { void translateSelection(); }); await call('translation_ready'); } catch (error) { const result = requireElement<HTMLDivElement>('#translation-result'); result.textContent = `无法接收划词：${errorMessage(error)}`; result.classList.add('error'); } }
     else { requireElement<HTMLParagraphElement>('#source-text').textContent = 'A little curiosity goes a long way.'; requireElement<HTMLDivElement>('#translation-result').textContent = '一点好奇心，可以走很远。'; }
     return;
   }
   try { settings = await call<Settings>('get_settings'); } catch (error) { loadError = `无法读取应用状态：${errorMessage(error)}`; }
   renderMain(); app.addEventListener('click', event => { void handleMainClick(event); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { stopManual(); updateManualView(); } });
   app.addEventListener('change', event => {
     const select = event.target as HTMLSelectElement;
     if (select.id !== 'provider-select') return;
     const provider = select.value as Provider; select.disabled = true;
     void selectProvider(provider).catch(error => { select.value = settings.provider; select.disabled = false; notify(errorMessage(error), 'error'); });
   });
-  app.addEventListener('input', event => { const target = event.target as HTMLInputElement; if (target.id === 'workspace-id') workspaceId = target.value; });
+  app.addEventListener('input', event => { const target = event.target as HTMLInputElement; if (target.id === 'workspace-id') workspaceId = target.value; if (target.id === 'manual-text') manualDraft = target.value; });
 }
 void bootstrap();
 
