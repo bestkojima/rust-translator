@@ -18,11 +18,19 @@ struct Settings {
     enabled: bool,
     excluded_apps: Vec<String>,
     target_language: String,
+    // A pre-existing configuration without this field used SiliconFlow.
+    #[serde(default = "legacy_provider")]
+    provider: String,
+    #[serde(default = "default_source_language")]
+    source_language: String,
 }
+
+fn legacy_provider() -> String { "siliconflow".into() }
+fn default_source_language() -> String { "en".into() }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: true, excluded_apps: vec!["WindowsTerminal.exe".into(), "cmd.exe".into(), "powershell.exe".into(), "pwsh.exe".into(), "1Password.exe".into(), "KeePass.exe".into()], target_language: "zh".into() }
+        Self { enabled: true, excluded_apps: vec!["WindowsTerminal.exe".into(), "cmd.exe".into(), "powershell.exe".into(), "pwsh.exe".into(), "1Password.exe".into(), "KeePass.exe".into()], target_language: "zh".into(), provider: "siliconflow".into(), source_language: default_source_language() }
     }
 }
 
@@ -31,7 +39,10 @@ struct SettingsResponse {
     enabled: bool,
     excluded_apps: Vec<String>,
     target_language: String,
+    provider: String,
+    source_language: String,
     has_key: bool,
+    credential_error: Option<String>,
     capture_error: Option<String>,
 }
 
@@ -55,18 +66,25 @@ fn key_entry() -> Result<keyring_core::Entry, String> {
 fn get_settings(state: State<'_, AppState>) -> Result<SettingsResponse, String> {
     let settings = state.settings.lock().map_err(|_| "读取设置失败")?.clone();
     let _guard = state.credential_lock.lock().map_err(|_| "读取凭据失败")?;
-    let has_key = match key_entry()?.get_password() {
-        Ok(value) => !value.is_empty(),
-        Err(keyring_core::Error::NoEntry) => false,
-        Err(e) => return Err(format!("读取凭据失败：{e}")),
+    let (has_key, credential_error) = match key_entry().and_then(|entry| {
+        match entry.get_password() {
+            Ok(value) => Ok(!value.is_empty()),
+            Err(keyring_core::Error::NoEntry) => Ok(false),
+            Err(e) => Err(format!("读取凭据失败：{e}")),
+        }
+    }) {
+        Ok(has_key) => (has_key, None),
+        Err(error) => (false, Some(error)),
     };
     let capture_error = state.capture_error.lock().map_err(|_| "读取划词状态失败")?.clone();
-    Ok(SettingsResponse { enabled: settings.enabled, excluded_apps: settings.excluded_apps, target_language: settings.target_language, has_key, capture_error })
+    Ok(SettingsResponse { enabled: settings.enabled, excluded_apps: settings.excluded_apps, target_language: settings.target_language, provider: settings.provider, source_language: settings.source_language, has_key, credential_error, capture_error })
 }
 
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
     if !["zh", "en", "ja"].contains(&settings.target_language.as_str()) { return Err("不支持该目标语言".into()); }
+    if !["zh", "en", "ja"].contains(&settings.source_language.as_str()) { return Err("不支持该源语言".into()); }
+    if !["mymemory", "siliconflow"].contains(&settings.provider.as_str()) { return Err("不支持该翻译服务".into()); }
     if let Some(dir) = state.config_path.parent() { fs::create_dir_all(dir).map_err(|e| format!("创建设置目录失败：{e}"))?; }
     let data = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
     fs::write(&state.config_path, data).map_err(|e| format!("保存设置失败：{e}"))?;
@@ -96,11 +114,15 @@ async fn translate_text(state: State<'_, AppState>, text: String) -> Result<Stri
     let text = text.trim();
     if text.is_empty() { return Err("请先选择或输入文字".into()); }
     if text.chars().count() > 5000 { return Err("单次最多翻译 5000 个字符".into()); }
+    let settings = state.settings.lock().map_err(|_| "读取设置失败")?.clone();
+    if settings.provider == "mymemory" {
+        return translate_mymemory(&state.client, text, &settings.source_language, &settings.target_language).await;
+    }
     let key = {
         let _guard = state.credential_lock.lock().map_err(|_| "读取凭据失败")?;
         key_entry()?.get_password().map_err(|_| "请先在设置中配置硅基流动 API Key")?
     };
-    let language = match state.settings.lock().map_err(|_| "读取设置失败")?.target_language.as_str() { "en" => "英文", "ja" => "日文", _ => "中文" };
+    let language = match settings.target_language.as_str() { "en" => "英文", "ja" => "日文", _ => "中文" };
     let prompt = format!("把下面的文本翻译成{language}，不要额外解释。\n\n{text}");
     let response = state.client.post("https://api.siliconflow.cn/v1/chat/completions")
         .bearer_auth(key)
@@ -112,6 +134,76 @@ async fn translate_text(state: State<'_, AppState>, text: String) -> Result<Stri
     let result = body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or("").trim();
     if result.is_empty() { return Err("翻译服务没有返回译文".into()); }
     Ok(result.to_string())
+}
+
+async fn translate_mymemory(client: &reqwest::Client, text: &str, source: &str, target: &str) -> Result<String, String> {
+    translate_mymemory_at(client, "https://api.mymemory.translated.net/get", text, source, target).await
+}
+
+async fn translate_mymemory_at(client: &reqwest::Client, endpoint: &str, text: &str, source: &str, target: &str) -> Result<String, String> {
+    if text.len() > 500 { return Err("MyMemory 每次最多 500 个 UTF-8 字节，请缩短选中文字或切换硅基流动".into()); }
+    if text.split('\n').any(|line| line.trim().is_empty()) { return Err("MyMemory 每次仅支持一个段落，请缩短选中文字或切换硅基流动".into()); }
+    if source == target { return Err("MyMemory 的源语言与目标语言相同，请在偏好设置中调整".into()); }
+    let to_code = |lang: &str| match lang { "zh" => "zh-CN", "ja" => "ja", _ => "en" };
+    let pair = format!("{}|{}", to_code(source), to_code(target));
+    let response = client.get(endpoint)
+        .query(&[("q", text), ("langpair", pair.as_str())])
+        .send().await.map_err(|e| if e.is_timeout() { "MyMemory 请求超时，请检查网络后重试".to_string() } else { "无法连接 MyMemory，请检查网络".to_string() })?;
+    let status = response.status();
+    if status.as_u16() == 429 { return Err("MyMemory 当前免费额度已用完或请求过快，请稍后再试，或在设置中切换硅基流动".into()); }
+    if !status.is_success() { return Err(format!("MyMemory 服务返回错误（HTTP {status}）")); }
+    let body: serde_json::Value = response.json().await.map_err(|_| "MyMemory 返回了无法识别的数据")?;
+    let response_status = body.get("responseStatus").and_then(|s| s.as_u64());
+    if response_status == Some(429) { return Err("MyMemory 当前免费额度已用完或请求过快，请稍后再试，或在设置中切换硅基流动".into()); }
+    if response_status != Some(200) { return Err("MyMemory 无法完成翻译，请检查语言选择或稍后重试".into()); }
+    let result = body.pointer("/responseData/translatedText").and_then(|s| s.as_str()).unwrap_or("").trim();
+    if result.is_empty() { return Err("MyMemory 没有返回译文".into()); }
+    Ok(html_escape::decode_html_entities(result).into_owned())
+}
+
+#[cfg(test)]
+mod translation_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn old_settings_keep_siliconflow() {
+        let old = r#"{"enabled":true,"excluded_apps":[],"target_language":"zh"}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(settings.provider, "siliconflow");
+        assert_eq!(settings.source_language, "en");
+        assert_eq!(Settings::default().provider, "siliconflow");
+    }
+
+    #[test]
+    fn mymemory_handles_response_and_quota_error() {
+        fn serve(status: &str, body: &str) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/get", listener.local_addr().unwrap());
+            let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(request.starts_with("GET /get?"));
+                assert!(request.contains("langpair=en%7Czh-CN"));
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            endpoint
+        }
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let good = serve("200 OK", r#"{"responseStatus":200,"responseData":{"translatedText":"你好 &amp; 欢迎"}}"#);
+        let result = tauri::async_runtime::block_on(translate_mymemory_at(&client, &good, "Hello", "en", "zh"));
+        assert_eq!(result.unwrap(), "你好 & 欢迎");
+        let limited = serve("429 Too Many Requests", "{}");
+        let result = tauri::async_runtime::block_on(translate_mymemory_at(&client, &limited, "Hello", "en", "zh"));
+        assert!(result.unwrap_err().contains("免费额度"));
+        let limited_json = serve("200 OK", r#"{"responseStatus":429,"responseData":{"translatedText":"WARNING"}}"#);
+        let result = tauri::async_runtime::block_on(translate_mymemory_at(&client, &limited_json, "Hello", "en", "zh"));
+        assert!(result.unwrap_err().contains("免费额度"));
+    }
 }
 
 #[derive(Serialize)]
@@ -149,7 +241,7 @@ fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> { app.cl
 
 #[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    let allowed = ["https://siliconflow.cn/", "https://cloud.siliconflow.cn/", "https://docs.siliconflow.cn/", "https://help.aliyun.com/", "https://mt.console.aliyun.com/", "https://openrouter.ai/", "https://ai.baidu.com/"];
+    let allowed = ["https://siliconflow.cn/", "https://cloud.siliconflow.cn/", "https://docs.siliconflow.cn/", "https://help.aliyun.com/", "https://mt.console.aliyun.com/", "https://openrouter.ai/", "https://ai.baidu.com/", "https://mymemory.translated.net/"];
     if !allowed.iter().any(|base| url.starts_with(base)) { return Err("只能打开列出的官方服务页面".into()); }
     app.opener().open_url(url, None::<&str>).map_err(|e| format!("无法打开浏览器：{e}"))
 }
@@ -193,8 +285,15 @@ fn translation_ready(window: tauri::WebviewWindow, state: State<'_, AppState>) -
 fn clamp_position(window: &tauri::WebviewWindow, x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
     if let Ok(monitors) = window.available_monitors() {
         if let Some(m) = monitors.iter().find(|m| { let p = m.position(); let s = m.size(); x >= p.x && x < p.x + s.width as i32 && y >= p.y && y < p.y + s.height as i32 }) {
-            let p = m.position(); let s = m.size();
-            return (x.clamp(p.x, (p.x + s.width as i32 - width).max(p.x)), y.clamp(p.y, (p.y + s.height as i32 - height).max(p.y)));
+            // Window sizes are logical pixels; captured mouse and work-area coordinates
+            // are physical pixels. Scale for the destination display, not the display
+            // on which this hidden window happened to be created.
+            let area = m.work_area();
+            let scale = m.scale_factor();
+            let physical_width = (width as f64 * scale).ceil() as i32;
+            let physical_height = (height as f64 * scale).ceil() as i32;
+            let p = area.position; let s = area.size;
+            return (x.clamp(p.x, (p.x + s.width as i32 - physical_width).max(p.x)), y.clamp(p.y, (p.y + s.height as i32 - physical_height).max(p.y)));
         }
     }
     (x, y)
@@ -207,7 +306,14 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let config_path = app.path().app_config_dir()?.join("settings.json");
-            let settings: Settings = fs::read(&config_path).ok().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default();
+            let settings: Settings = fs::read(&config_path).ok().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_else(|| {
+                let mut settings = Settings::default();
+                // Earlier versions could save a key without writing settings.json.
+                if matches!(key_entry().and_then(|entry| entry.get_password().map_err(|e| e.to_string())), Ok(key) if !key.is_empty()) {
+                    settings.provider = legacy_provider();
+                }
+                settings
+            });
             capture::set_enabled(settings.enabled);
             capture::set_excluded_apps(settings.excluded_apps.clone());
             app.manage(AppState { settings: Mutex::new(settings), pending: Mutex::new(String::new()), credential_lock: Mutex::new(()), capture_error: Mutex::new(None), translation_ready: AtomicBool::new(false), translation_pending: AtomicBool::new(false), client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?, config_path });
