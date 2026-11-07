@@ -15,7 +15,7 @@ const MODEL: &str = "tencent/Hunyuan-MT-7B";
 const ALIYUN_MODEL: &str = "deepseek-v4.1-flash";
 const ALIYUN_ENDPOINT: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 const SERVICE: &str = "com.wordglance.app";
-const OVERLAY_SIZE: i32 = 20;
+const OVERLAY_SIZE: i32 = 28;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
@@ -814,7 +814,7 @@ mod placement_tests {
         assert!(contains_point((0, 0), (1920, 1080), anchor));
         let target = (anchor.0 + 12, anchor.1 + 12);
         assert!(!contains_point((0, 0), (1920, 1080), target));
-        assert_eq!(clamp_to_work_area(target, (OVERLAY_SIZE, OVERLAY_SIZE), (0, 0), (1920, 1040), 1.0), (1900, 1020));
+        assert_eq!(clamp_to_work_area(target, (OVERLAY_SIZE, OVERLAY_SIZE), (0, 0), (1920, 1040), 1.0), (1892, 1012));
     }
 
     #[test]
@@ -822,7 +822,7 @@ mod placement_tests {
         let anchor = (-2, 500);
         assert!(contains_point((-1920, 0), (1920, 1080), anchor));
         assert!(!contains_point((0, 0), (1920, 1080), anchor));
-        assert_eq!(clamp_to_work_area((anchor.0 + 12, anchor.1 + 12), (OVERLAY_SIZE, OVERLAY_SIZE), (-1920, 0), (1920, 1040), 1.5), (-30, 512));
+        assert_eq!(clamp_to_work_area((anchor.0 + 12, anchor.1 + 12), (OVERLAY_SIZE, OVERLAY_SIZE), (-1920, 0), (1920, 1040), 1.5), (-42, 512));
     }
 }
 
@@ -845,8 +845,14 @@ fn main() {
             capture::set_excluded_apps(settings.excluded_apps.clone());
             app.manage(AppState { settings: Mutex::new(settings), pending: Mutex::new(String::new()), credential_lock: Mutex::new(()), capture_error: Mutex::new(None), translation_ready: AtomicBool::new(false), translation_pending: AtomicBool::new(false), client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?, aliyun_client: aliyun_http_client()?, stream_client: stream_http_client()?, config_path, streams: Mutex::new(StreamRegistry::default()) });
 
-            WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("index.html?window=overlay".into()))
-                .title("一划").inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64).decorations(false).transparent(true).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).focused(false).build()?;
+            let overlay = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("index.html?window=overlay".into()))
+                .title("一划").inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)
+                .min_inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)
+                .max_inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)
+                .decorations(false).shadow(false).transparent(true).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).focused(false).build()?;
+            // The initial WM_GETMINMAXINFO arrives before tao installs its size constraints.
+            // Resize once after creation so Windows' default minimum cannot enlarge the bubble.
+            overlay.set_size(tauri::LogicalSize::new(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64))?;
             WebviewWindowBuilder::new(app, "translation", WebviewUrl::App("index.html?window=translation".into()))
                 .title("一划翻译").inner_size(420.0, 350.0).decorations(false).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).build()?;
             let show = MenuItem::with_id(app, "show", "打开一划", true, None::<&str>)?;

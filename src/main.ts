@@ -374,6 +374,7 @@ async function handleMainClick(event: Event) {
 }
 
 function renderOverlay() {
+  document.documentElement.classList.add('overlay-root');
   document.body.className = 'overlay-body';
   app.innerHTML = `<button id="translate-bubble" class="translate-bubble" aria-label="翻译选中文字" title="翻译选中文字">${icons.translate}</button><div id="toast" class="toast overlay-toast" role="status"></div>`;
   document.querySelector('#translate-bubble')?.addEventListener('click', async () => { try { await call('open_translation'); } catch (error) { notify(errorMessage(error), 'error'); } });
