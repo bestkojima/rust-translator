@@ -2,7 +2,7 @@ import './style.css';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
-type Provider = 'mymemory' | 'siliconflow';
+type Provider = 'mymemory' | 'siliconflow' | 'aliyun';
 type Settings = { enabled: boolean; excluded_apps: string[]; has_key: boolean; provider: Provider; source_language: string; target_language: string; capture_error?: string | null; credential_error?: string | null };
 type FreeModel = { id: string; name: string };
 type SelectionEvent = { text?: string };
@@ -26,6 +26,9 @@ const urls = {
   aliPrice: 'https://help.aliyun.com/zh/machine-translation/product-overview/billing-overview',
   openrouter: 'https://openrouter.ai/collections/free-models', aliSignup: 'https://mt.console.aliyun.com/', routerSignup: 'https://openrouter.ai/signup',
   mymemoryLimits: 'https://mymemory.translated.net/doc/usagelimits.php', mymemoryPrivacy: 'https://mymemory.translated.net/terms-and-conditions',
+  bailianConsole: 'https://bailian.console.aliyun.com/',
+  bailianPrice: 'https://help.aliyun.com/zh/model-studio/model-pricing',
+  bailianFree: 'https://help.aliyun.com/zh/model-studio/new-free-quota',
 };
 let settings: Settings = { enabled: true, excluded_apps: [], has_key: false, provider: 'siliconflow', source_language: 'en', target_language: 'zh' };
 let page: Page = 'translate';
@@ -62,17 +65,33 @@ function navigation() {
 }
 function statusMarkup() { const problem = loadError || settings.capture_error; return `<span class="status-dot ${problem ? 'failed' : !isTauri || !settings.enabled ? 'off' : ''}"></span>${problem ? '划词状态异常' : !isTauri ? '浏览器预览' : settings.enabled ? '划词已开启' : '划词已暂停'}`; }
 function captureWarning() { const problem = loadError || settings.capture_error; return problem ? `<div class="capture-warning" role="alert"><strong>划词状态异常</strong><span>${escapeHtml(problem)}</span></div>` : ''; }
+function providerPicker() {
+  const choice = (id: Provider, label: string, caption: string) => `<button class="provider-choice ${settings.provider === id ? 'active' : ''}" data-action="use-${id}" aria-pressed="${settings.provider === id}"><strong>${label}</strong><span>${caption}</span></button>`;
+  return `<div class="provider-picker" aria-label="翻译服务">${choice('aliyun', '阿里云百炼', 'DeepSeek · 自备 Key')}${choice('siliconflow', '硅基流动', '翻译模型 · 自备 Key')}${choice('mymemory', 'MyMemory', '免密钥 · 免费额度')}</div>`;
+}
+function providerDetails() {
+  if (settings.provider === 'mymemory') {
+    return `<div class="provider-head"><div class="provider-icon">M</div><div class="provider-title"><strong>MyMemory</strong><p>英文、中文、日文短文本翻译</p></div><span class="connection connected"><i></i>已选择</span></div><p class="provider-description">无需注册；匿名额度为每日 5,000 字符，单次最多 500 UTF-8 字节、一个段落。额度与网络出口相关，可能已用尽；请在偏好设置中选择原文语言。</p><div class="provider-privacy"><strong>请勿翻译敏感内容。</strong>点击翻译后原文会发送至 MyMemory；服务商称提交的文本片段可能长期保存，并可能与其合作方共享。<button class="text-link" data-url="${urls.mymemoryPrivacy}">隐私条款 ${icons.external}</button><button class="text-link" data-url="${urls.mymemoryLimits}">额度说明 ${icons.external}</button></div>`;
+  }
+  const aliyun = settings.provider === 'aliyun';
+  const name = aliyun ? '阿里云百炼' : '硅基流动';
+  const model = aliyun ? 'DeepSeek-V4.1-Flash' : 'Hunyuan-MT-7B';
+  const description = aliyun
+    ? `点击翻译后原文会发送至阿里云百炼。符合条件的北京地域账户可享 90 天试用额度，额度用完可能自动扣费。请先核对账户额度，并在控制台开启「免费额度用完即停」。<span class="provider-links"><button class="text-link" data-url="${urls.bailianFree}">额度与用完即停 ${icons.external}</button><button class="text-link" data-url="${urls.bailianPrice}">模型价格 ${icons.external}</button></span>`
+    : '使用自己的 API Key；点击翻译后原文会发送至硅基流动。免费政策以官方价格为准。';
+  return `<div class="provider-head"><div class="provider-icon ${aliyun ? 'ali' : ''}">${aliyun ? '阿' : 'S'}</div><div class="provider-title"><strong>${name}</strong><p>${model} <span>·</span> ${aliyun ? '北京地域' : '翻译模型'}</p></div><span class="connection ${settings.has_key ? 'connected' : ''}"><i></i>${settings.has_key ? '已保存密钥' : '尚未配置'}</span></div><div class="provider-description">${description}</div>${settings.credential_error ? `<p class="error small" role="alert">${escapeHtml(settings.credential_error)}</p>` : ''}<label class="input-label" for="api-key">${name} API Key</label><div class="key-row"><div class="key-input-wrap"><input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="${settings.has_key ? '已保存，输入新密钥可替换' : `粘贴你的${name} API Key`}"/><button class="key-visibility" data-action="toggle-key" aria-label="显示密钥" title="显示密钥">显示</button></div><button class="button primary" data-action="save-key">保存密钥</button>${settings.has_key ? '<button class="button secondary" data-action="clear-key">清除</button>' : ''}</div><div class="key-footer"><span>密钥分别保存在 Windows 凭据管理器中</span><button class="text-link" data-url="${aliyun ? urls.bailianConsole : urls.siliconSignup}">申请 API Key ${icons.external}</button></div>`;
+}
 function mainPage() {
   return `<div class="page-head"><div><div class="eyebrow">YOUR READING COMPANION</div><h1>读下去，<span>不必停。</span></h1><p class="lead">选中不懂的句子，点一下图标，译文就在眼前。</p></div><span class="top-status">${statusMarkup()}</span></div>
   ${captureWarning()}<section class="hero" aria-label="划词翻译使用方法"><div class="hero-copy"><div class="hero-kicker"><span class="mini-spark">✳</span> 简单三步</div><h2>让语言的距离，<br>只有<span>一划。</span></h2><p>在浏览器或文档中选中文字，点击出现的图标，即可查看翻译。</p><button class="text-link light-link" data-action="to-settings">管理划词设置 ${icons.arrow}</button></div><div class="hero-art" aria-hidden="true"><div class="paper-line short"></div><div class="paper-line"></div><div class="sample-selection">A little curiosity goes a long way.<span class="sample-bubble">${icons.translate}</span></div><div class="paper-line medium"></div><div class="sample-card"><span>中</span><div><small>译文</small><strong>一点好奇心，可以走很远。</strong></div></div><div class="hero-star one">✳</div><div class="hero-star two">✳</div></div></section>
   <div class="section-top"><div><span class="section-kicker">READY WHEN YOU ARE</span><h2>配置翻译服务</h2></div><button class="text-link" data-action="to-discover">寻找免费接口 ${icons.arrow}</button></div>
-  <section class="provider-card"><div class="provider-picker" aria-label="翻译服务"><button class="provider-choice ${settings.provider === 'siliconflow' ? 'active' : ''}" data-action="use-siliconflow" aria-pressed="${settings.provider === 'siliconflow'}"><strong>硅基流动</strong><span>自备 API Key</span></button><button class="provider-choice ${settings.provider === 'mymemory' ? 'active' : ''}" data-action="use-mymemory" aria-pressed="${settings.provider === 'mymemory'}"><strong>MyMemory</strong><span>免密钥 · 免费额度</span></button></div>
-  ${settings.provider === 'mymemory' ? `<div class="provider-head"><div class="provider-icon">M</div><div class="provider-title"><strong>MyMemory</strong><p>英文、中文、日文短文本翻译</p></div><span class="connection connected"><i></i>已选择</span></div><p class="provider-description">无需注册；匿名额度为每日 5,000 字符，单次最多 500 UTF-8 字节、一个段落。额度与网络出口相关，可能已用尽；请在偏好设置中选择原文语言。</p><div class="provider-privacy"><strong>请勿翻译敏感内容。</strong>点击翻译后原文会发送至 MyMemory；服务商称提交的文本片段可能长期保存，并可能与其合作方共享。<button class="text-link" data-url="${urls.mymemoryPrivacy}">隐私条款 ${icons.external}</button><button class="text-link" data-url="${urls.mymemoryLimits}">额度说明 ${icons.external}</button></div>` : `<div class="provider-head"><div class="provider-icon">S</div><div class="provider-title"><strong>硅基流动</strong><p>Hunyuan-MT-7B <span>·</span> 翻译模型</p></div><span class="connection ${settings.has_key ? 'connected' : ''}"><i></i>${settings.has_key ? '已保存密钥' : '尚未配置'}</span></div><p class="provider-description">使用自己的 API Key；点击翻译后原文会发送至硅基流动。免费政策以官方价格为准。</p>${settings.credential_error ? `<p class="error small" role="alert">${escapeHtml(settings.credential_error)}</p>` : ''}<label class="input-label" for="api-key">API Key</label><div class="key-row"><div class="key-input-wrap"><input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="${settings.has_key ? '已保存，输入新密钥可替换' : '粘贴你的硅基流动 API Key'}"/><button class="key-visibility" data-action="toggle-key" aria-label="显示密钥" title="显示密钥">显示</button></div><button class="button primary" data-action="save-key">保存密钥</button>${settings.has_key ? '<button class="button secondary" data-action="clear-key">清除</button>' : ''}</div><div class="key-footer"><span>密钥保存在 Windows 凭据管理器中</span><button class="text-link" data-url="${urls.siliconSignup}">申请 API Key ${icons.external}</button></div>`}</section>
+  <section class="provider-card">${providerPicker()}${providerDetails()}</section>
   <section class="manual"><div><span class="section-kicker">PASTE & TRANSLATE</span><h2>手动翻译</h2><p>遇到无法划词的应用，可以在这里粘贴文字。</p></div><label class="sr-only" for="manual-text">输入需要翻译的文字</label><textarea id="manual-text" rows="3" placeholder="在这里粘贴或输入文字…"></textarea><div class="manual-actions"><span>内容仅在点击翻译后发送</span><button class="button primary" data-action="manual-translate">翻译文字 ${icons.arrow}</button></div><div id="manual-result" class="manual-result" hidden></div></section>`;
 }
 function discoverPage() {
   return `<div class="page-head"><div><div class="eyebrow">FIND YOUR API</div><h1>好用的接口，<span>慢慢找。</span></h1><p class="lead">从官方入口开始，找适合自己的免费翻译服务。</p></div><span class="top-status">资料核对于 2026.11.07</span></div><div class="info-band"><span>✳</span><p><strong>免费政策会变。</strong>使用前请核对服务商的最新价格和账户额度；应用不会自动切换到收费模型。</p></div><div class="catalog-head"><div><span class="section-kicker">THE SHORTLIST</span><h2>精选入口</h2></div><span class="muted small">官方资料 · 非实时价格</span></div>
   <section class="catalog"><article class="catalog-card"><div class="catalog-top"><div class="provider-icon">M</div><div><h3>MyMemory <span class="pill">无需密钥</span></h3><p>短文本翻译 · 匿名使用</p></div><span class="free-label">每日免费额度</span></div><p class="catalog-desc">每天 5,000 字符，每次最多 500 UTF-8 字节、一个段落。文本会发送至服务商；服务商称提交文本可能长期保存并与合作方共享，请勿发送敏感内容。</p><div class="catalog-actions"><button class="button dark" data-action="use-mymemory">选择 MyMemory ${icons.arrow}</button><button class="text-link" data-url="${urls.mymemoryLimits}">额度说明 ${icons.external}</button><button class="text-link" data-url="${urls.mymemoryPrivacy}">隐私条款 ${icons.external}</button></div></article><article class="catalog-card"><div class="catalog-top"><div class="provider-icon">S</div><div><h3>硅基流动</h3><p>Hunyuan-MT-7B · 翻译模型</p></div><span class="free-label">当前标价免费</span></div><p class="catalog-desc">模型输入、输出在官方价格页标为免费。需注册、实名认证，免费模型有速率限制。</p><div class="catalog-actions"><button class="button dark" data-action="use-siliconflow">配置使用 ${icons.arrow}</button><button class="text-link" data-url="${urls.siliconPrice}">官方价格 ${icons.external}</button></div></article>
+  <article class="catalog-card"><div class="catalog-top"><div class="provider-icon ali">阿</div><div><h3>阿里云百炼 · DeepSeek</h3><p>DeepSeek-V4.1-Flash · 北京地域</p></div><span class="free-label warm">限时试用额度</span></div><p class="catalog-desc">符合条件的账户可享 90 天试用额度；超出后可能扣费，建议开启「免费额度用完即停」。</p><div class="catalog-actions"><button class="button dark" data-action="use-aliyun">配置使用 ${icons.arrow}</button><button class="text-link" data-url="${urls.bailianFree}">额度说明 ${icons.external}</button><button class="text-link" data-url="${urls.bailianPrice}">模型价格 ${icons.external}</button></div></article>
   <article class="catalog-card"><div class="catalog-top"><div class="provider-icon ali">阿</div><div><h3>阿里云机器翻译</h3><p>通用版 · 按字符计费</p></div><span class="free-label warm">每月免费额度</span></div><p class="catalog-desc">官方列有每月 100 万字符免费额度，超额可能自动进入后付费。此处提供发现入口。</p><div class="catalog-actions"><button class="text-link" data-url="${urls.aliPrice}">查看官方价格 ${icons.external}</button><button class="text-link" data-url="${urls.aliSignup}">前往申请 ${icons.external}</button></div></article>
   <article class="catalog-card"><div class="catalog-top"><div class="provider-icon router">O</div><div><h3>OpenRouter</h3><p>免费大模型 · 适合探索</p></div><span class="free-label">免费模型</span></div><p class="catalog-desc">免费模型有调用次数限制；实际可用性及数据政策以官方页面和账户为准。此处提供发现入口。</p><div class="catalog-actions"><button class="button secondary" data-action="refresh-models">刷新免费模型</button><button class="text-link" data-url="${urls.openrouter}">官方说明 ${icons.external}</button><button class="text-link" data-url="${urls.routerSignup}">前往注册 ${icons.external}</button></div><div id="model-list" class="model-list">${modelList()}</div></article></section>`;
 }
@@ -83,7 +102,7 @@ function modelList() {
 }
 function settingsPage() {
   const options = (selected: string) => `<option value="en" ${selected === 'en' ? 'selected' : ''}>英语</option><option value="zh" ${selected === 'zh' ? 'selected' : ''}>中文</option><option value="ja" ${selected === 'ja' ? 'selected' : ''}>日语</option>`;
-  return `<div class="page-head"><div><div class="eyebrow">MAKE IT YOURS</div><h1>安静地，<span>刚刚好。</span></h1><p class="lead">把划词体验调整成适合你的样子。</p></div><span class="top-status">${statusMarkup()}</span></div>${captureWarning()}<section class="settings-card"><div class="setting-row"><div><h3>自动划词</h3><p>选中文字后显示翻译图标。暂停后仍可手动翻译。</p></div><label class="switch"><input type="checkbox" id="enabled" ${settings.enabled ? 'checked' : ''}/><span></span><span class="sr-only">开启自动划词</span></label></div><div class="setting-row column"><div><h3>排除应用</h3><p>在不希望显示图标的程序中暂停划词，每行一个程序名，例如 <code>Code.exe</code>。</p></div><label class="sr-only" for="excluded-apps">排除应用，每行一个</label><textarea id="excluded-apps" rows="4" placeholder="例如：&#10;WindowsTerminal.exe&#10;KeePass.exe">${escapeHtml(settings.excluded_apps.join('\n'))}</textarea></div><div class="setting-row column"><div><h3>原文语言</h3><p>MyMemory 使用所选原文语言；硅基流动自动识别。</p></div><label class="sr-only" for="source-language">原文语言</label><select id="source-language">${options(settings.source_language)}</select></div><div class="setting-row column"><div><h3>目标语言</h3><p>选择翻译结果使用的语言；使用 MyMemory 时请与原文语言选不同的语言。</p></div><label class="sr-only" for="target-language">目标语言</label><select id="target-language">${options(settings.target_language)}</select></div><div class="settings-actions"><button class="button primary" data-action="save-settings">保存设置</button></div></section><div class="privacy-note"><span>✳</span><div><strong>你的选择，你来决定。</strong><p>应用会在本机读取选中文本以显示图标；点击翻译时，原文才会发送到已配置的翻译服务。</p></div></div>`;
+  return `<div class="page-head"><div><div class="eyebrow">MAKE IT YOURS</div><h1>安静地，<span>刚刚好。</span></h1><p class="lead">把划词体验调整成适合你的样子。</p></div><span class="top-status">${statusMarkup()}</span></div>${captureWarning()}<section class="settings-card"><div class="setting-row"><div><h3>自动划词</h3><p>选中文字后显示翻译图标。暂停后仍可手动翻译。</p></div><label class="switch"><input type="checkbox" id="enabled" ${settings.enabled ? 'checked' : ''}/><span></span><span class="sr-only">开启自动划词</span></label></div><div class="setting-row column"><div><h3>排除应用</h3><p>在不希望显示图标的程序中暂停划词，每行一个程序名，例如 <code>Code.exe</code>。</p></div><label class="sr-only" for="excluded-apps">排除应用，每行一个</label><textarea id="excluded-apps" rows="4" placeholder="例如：&#10;WindowsTerminal.exe&#10;KeePass.exe">${escapeHtml(settings.excluded_apps.join('\n'))}</textarea></div><div class="setting-row column"><div><h3>原文语言</h3><p>MyMemory 使用所选原文语言；硅基流动与阿里云百炼自动识别。</p></div><label class="sr-only" for="source-language">原文语言</label><select id="source-language">${options(settings.source_language)}</select></div><div class="setting-row column"><div><h3>目标语言</h3><p>选择翻译结果使用的语言；使用 MyMemory 时请与原文语言选不同的语言。</p></div><label class="sr-only" for="target-language">目标语言</label><select id="target-language">${options(settings.target_language)}</select></div><div class="settings-actions"><button class="button primary" data-action="save-settings">保存设置</button></div></section><div class="privacy-note"><span>✳</span><div><strong>你的选择，你来决定。</strong><p>应用会在本机读取选中文本以显示图标；点击翻译时，原文才会发送到已配置的翻译服务。</p></div></div>`;
 }
 function renderMain() {
   app.innerHTML = `<div class="app-shell">${navigation()}<main class="main-content"><div class="main-inner">${page === 'translate' ? mainPage() : page === 'discover' ? discoverPage() : settingsPage()}</div><footer class="footer"><span>读得专注，想得更远。</span><span>YIHUA / 一划</span></footer></main></div><div id="toast" class="toast" role="status" aria-live="polite"></div>${!isTauri ? '<div class="preview-badge">浏览器预览</div>' : ''}`;
@@ -93,13 +112,14 @@ function requireElement<T extends HTMLElement>(selector: string): T { const el =
 async function saveKey() {
   const input = requireElement<HTMLInputElement>('#api-key'); const apiKey = input.value.trim();
   if (!apiKey) { input.focus(); notify('请先输入 API Key', 'error'); return; }
-  await call('set_api_key', { apiKey }); settings.has_key = true; renderMain(); notify('密钥已保存');
+  await call('set_api_key', { apiKey, provider: settings.provider }); settings.has_key = true; settings.credential_error = null; renderMain(); notify('密钥已保存');
 }
 async function selectProvider(provider: Provider) {
   if (provider !== settings.provider) {
     const { enabled, excluded_apps, source_language, target_language } = settings;
     await call('save_settings', { settings: { enabled, excluded_apps, source_language, target_language, provider } });
-    settings = { ...settings, provider };
+    try { settings = await call<Settings>('get_settings'); }
+    catch (error) { settings = { ...settings, provider, has_key: false, credential_error: `无法读取密钥状态：${errorMessage(error)}` }; }
   }
   go('translate');
 }
@@ -138,9 +158,10 @@ async function handleMainClick(event: Event) {
       case 'to-translate': go('translate'); break;
       case 'use-mymemory': await selectProvider('mymemory'); break;
       case 'use-siliconflow': await selectProvider('siliconflow'); break;
+      case 'use-aliyun': await selectProvider('aliyun'); break;
       case 'toggle-key': { const input = requireElement<HTMLInputElement>('#api-key'); input.type = input.type === 'password' ? 'text' : 'password'; button.textContent = input.type === 'password' ? '显示' : '隐藏'; button.setAttribute('aria-label', input.type === 'password' ? '显示密钥' : '隐藏密钥'); break; }
       case 'save-key': await saveKey(); break;
-      case 'clear-key': await call('clear_api_key'); settings.has_key = false; renderMain(); notify('密钥已清除'); break;
+      case 'clear-key': await call('clear_api_key', { provider: settings.provider }); settings.has_key = false; settings.credential_error = null; renderMain(); notify('密钥已清除'); break;
       case 'save-settings': await saveSettings(); break;
       case 'manual-translate': await manualTranslate(button); break;
       case 'refresh-models': await refreshModels(button); break;
@@ -180,7 +201,7 @@ async function translateSelection(retry = false) {
     if (!text.trim()) throw new Error('没有获取到选中文字，请重新选择。');
     lastSource = text;
     source.textContent = text; length.textContent = `${text.length} 字符`;
-    try { const current = await call<Settings>('get_settings'); provider.textContent = current.provider === 'mymemory' ? '由 MyMemory 提供' : '由硅基流动提供'; } catch { provider.textContent = ''; }
+    try { const current = await call<Settings>('get_settings'); provider.textContent = current.provider === 'mymemory' ? '由 MyMemory 提供' : current.provider === 'aliyun' ? '由阿里云百炼提供' : '由硅基流动提供'; } catch { provider.textContent = ''; }
     if (generation !== selectionGeneration) return;
     const translated = await call<string>('translate_text', { text });
     if (generation !== selectionGeneration) return;

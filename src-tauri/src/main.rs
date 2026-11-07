@@ -11,6 +11,8 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 const MODEL: &str = "tencent/Hunyuan-MT-7B";
+const ALIYUN_MODEL: &str = "deepseek-v4.1-flash";
+const ALIYUN_ENDPOINT: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 const SERVICE: &str = "com.wordglance.app";
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -54,25 +56,42 @@ struct AppState {
     translation_ready: AtomicBool,
     translation_pending: AtomicBool,
     client: reqwest::Client,
+    aliyun_client: reqwest::Client,
     config_path: PathBuf,
 }
 
 fn key_entry() -> Result<keyring_core::Entry, String> {
+    key_entry_for("siliconflow")
+}
+
+fn key_provider(provider: Option<&str>) -> Result<&str, String> {
+    match provider.unwrap_or("siliconflow") {
+        "siliconflow" => Ok("siliconflow"),
+        "aliyun" => Ok("aliyun"),
+        _ => Err("该翻译服务不使用 API Key".into()),
+    }
+}
+
+fn key_entry_for(provider: &str) -> Result<keyring_core::Entry, String> {
+    let provider = key_provider(Some(provider))?;
     let modifiers = HashMap::from([("persistence", "Local")]);
-    keyring_core::Entry::new_with_modifiers(SERVICE, "siliconflow", &modifiers).map_err(|e| format!("凭据存储不可用：{e}"))
+    keyring_core::Entry::new_with_modifiers(SERVICE, provider, &modifiers).map_err(|e| format!("凭据存储不可用：{e}"))
 }
 
 #[tauri::command]
-fn get_settings(state: State<'_, AppState>) -> Result<SettingsResponse, String> {
+fn get_settings(state: State<'_, AppState>, provider: Option<String>) -> Result<SettingsResponse, String> {
     let settings = state.settings.lock().map_err(|_| "读取设置失败")?.clone();
+    let key_provider = provider.as_deref().unwrap_or(&settings.provider);
+    if !["mymemory", "siliconflow", "aliyun"].contains(&key_provider) { return Err("不支持该翻译服务".into()); }
     let _guard = state.credential_lock.lock().map_err(|_| "读取凭据失败")?;
-    let (has_key, credential_error) = match key_entry().and_then(|entry| {
+    let key_status = if key_provider == "mymemory" { Ok(false) } else { key_entry_for(key_provider).and_then(|entry| {
         match entry.get_password() {
             Ok(value) => Ok(!value.is_empty()),
             Err(keyring_core::Error::NoEntry) => Ok(false),
             Err(e) => Err(format!("读取凭据失败：{e}")),
         }
-    }) {
+    }) };
+    let (has_key, credential_error) = match key_status {
         Ok(has_key) => (has_key, None),
         Err(error) => (false, Some(error)),
     };
@@ -84,7 +103,7 @@ fn get_settings(state: State<'_, AppState>) -> Result<SettingsResponse, String> 
 fn save_settings(app: tauri::AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
     if !["zh", "en", "ja"].contains(&settings.target_language.as_str()) { return Err("不支持该目标语言".into()); }
     if !["zh", "en", "ja"].contains(&settings.source_language.as_str()) { return Err("不支持该源语言".into()); }
-    if !["mymemory", "siliconflow"].contains(&settings.provider.as_str()) { return Err("不支持该翻译服务".into()); }
+    if !["mymemory", "siliconflow", "aliyun"].contains(&settings.provider.as_str()) { return Err("不支持该翻译服务".into()); }
     if let Some(dir) = state.config_path.parent() { fs::create_dir_all(dir).map_err(|e| format!("创建设置目录失败：{e}"))?; }
     let data = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
     fs::write(&state.config_path, data).map_err(|e| format!("保存设置失败：{e}"))?;
@@ -96,17 +115,17 @@ fn save_settings(app: tauri::AppHandle, state: State<'_, AppState>, settings: Se
 }
 
 #[tauri::command]
-fn set_api_key(state: State<'_, AppState>, api_key: String) -> Result<(), String> {
+fn set_api_key(state: State<'_, AppState>, api_key: String, provider: Option<String>) -> Result<(), String> {
     let key = api_key.trim();
     if key.is_empty() { return Err("请先填写 API Key".into()); }
     let _guard = state.credential_lock.lock().map_err(|_| "保存凭据失败")?;
-    key_entry()?.set_password(key).map_err(|e| format!("保存凭据失败：{e}"))
+    key_entry_for(key_provider(provider.as_deref())?)?.set_password(key).map_err(|e| format!("保存凭据失败：{e}"))
 }
 
 #[tauri::command]
-fn clear_api_key(state: State<'_, AppState>) -> Result<(), String> {
+fn clear_api_key(state: State<'_, AppState>, provider: Option<String>) -> Result<(), String> {
     let _guard = state.credential_lock.lock().map_err(|_| "删除凭据失败")?;
-    match key_entry()?.delete_credential() { Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()), Err(e) => Err(format!("删除凭据失败：{e}")) }
+    match key_entry_for(key_provider(provider.as_deref())?)?.delete_credential() { Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()), Err(e) => Err(format!("删除凭据失败：{e}")) }
 }
 
 #[tauri::command]
@@ -118,11 +137,20 @@ async fn translate_text(state: State<'_, AppState>, text: String) -> Result<Stri
     if settings.provider == "mymemory" {
         return translate_mymemory(&state.client, text, &settings.source_language, &settings.target_language).await;
     }
+    if !["siliconflow", "aliyun"].contains(&settings.provider.as_str()) { return Err("不支持该翻译服务".into()); }
     let key = {
         let _guard = state.credential_lock.lock().map_err(|_| "读取凭据失败")?;
-        key_entry()?.get_password().map_err(|_| "请先在设置中配置硅基流动 API Key")?
+        let provider_name = if settings.provider == "aliyun" { "阿里云百炼" } else { "硅基流动" };
+        match key_entry_for(&settings.provider)?.get_password() {
+            Ok(key) => key,
+            Err(keyring_core::Error::NoEntry) => return Err(format!("请先在设置中配置{provider_name} API Key")),
+            Err(e) => return Err(format!("读取{provider_name}凭据失败：{e}")),
+        }
     };
     let language = match settings.target_language.as_str() { "en" => "英文", "ja" => "日文", _ => "中文" };
+    if settings.provider == "aliyun" {
+        return translate_aliyun_at(&state.aliyun_client, ALIYUN_ENDPOINT, &key, text, language).await;
+    }
     let prompt = format!("把下面的文本翻译成{language}，不要额外解释。\n\n{text}");
     let response = state.client.post("https://api.siliconflow.cn/v1/chat/completions")
         .bearer_auth(key)
@@ -133,6 +161,39 @@ async fn translate_text(state: State<'_, AppState>, text: String) -> Result<Stri
     let body: serde_json::Value = response.json().await.map_err(|_| "翻译服务返回了无法识别的数据")?;
     let result = body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or("").trim();
     if result.is_empty() { return Err("翻译服务没有返回译文".into()); }
+    Ok(result.to_string())
+}
+
+fn aliyun_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    // The fixed endpoint never needs redirects. Do not forward a Bearer token to
+    // an unexpected destination if the server returns a redirect.
+    reqwest::Client::builder().timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build()
+}
+
+async fn translate_aliyun_at(client: &reqwest::Client, endpoint: &str, key: &str, text: &str, language: &str) -> Result<String, String> {
+    let prompt = format!("把下面的文本翻译成{language}，只返回译文，不要额外解释。\n\n{text}");
+    let response = client.post(endpoint)
+        .bearer_auth(key)
+        .json(&serde_json::json!({"model":ALIYUN_MODEL,"messages":[{"role":"user","content":prompt}],"enable_thinking":false,"stream":false,"max_tokens":2048}))
+        .send().await.map_err(|e| if e.is_timeout() { "阿里云百炼请求超时，请检查网络后重试".to_string() } else { "无法连接阿里云百炼，请检查网络或代理".to_string() })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(match status.as_u16() {
+            300..=399 => format!("阿里云百炼返回重定向（HTTP {status}），为保护密钥未跟随"),
+            400 => "阿里云百炼拒绝了请求（HTTP 400），请检查模型及请求参数".into(),
+            401 => "阿里云百炼认证失败（HTTP 401），请检查北京地域的百炼 API Key".into(),
+            403 => "阿里云百炼拒绝访问（HTTP 403），请检查模型权限和账户额度".into(),
+            404 => "阿里云百炼未找到接口或模型（HTTP 404），请核对模型是否可用".into(),
+            429 => "阿里云百炼请求过快或额度不足（HTTP 429），请查看控制台".into(),
+            _ => format!("阿里云百炼返回错误（HTTP {status}）"),
+        });
+    }
+    let body: serde_json::Value = response.json().await.map_err(|_| "阿里云百炼返回了无法识别的数据")?;
+    if body.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) == Some("length") {
+        return Err("译文被长度限制截断，请缩短原文后重试".into());
+    }
+    let result = body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if result.is_empty() { return Err("阿里云百炼没有返回译文，请检查模型权限或重试".into()); }
     Ok(result.to_string())
 }
 
@@ -174,6 +235,9 @@ mod translation_tests {
         assert_eq!(settings.provider, "siliconflow");
         assert_eq!(settings.source_language, "en");
         assert_eq!(Settings::default().provider, "siliconflow");
+        assert_eq!(key_provider(None).unwrap(), "siliconflow");
+        assert_eq!(key_provider(Some("aliyun")).unwrap(), "aliyun");
+        assert!(key_provider(Some("mymemory")).is_err());
     }
 
     #[test]
@@ -203,6 +267,60 @@ mod translation_tests {
         let limited_json = serve("200 OK", r#"{"responseStatus":429,"responseData":{"translatedText":"WARNING"}}"#);
         let result = tauri::async_runtime::block_on(translate_mymemory_at(&client, &limited_json, "Hello", "en", "zh"));
         assert!(result.unwrap_err().contains("免费额度"));
+    }
+
+    #[test]
+    fn aliyun_request_and_failures() {
+        fn serve(response: String) -> (String, std::thread::JoinHandle<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+            let task = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let count = stream.read(&mut buf).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buf[..count]);
+                    if let Some(split) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..split]);
+                        let len = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+                        }).unwrap_or(0);
+                        if request.len() >= split + 4 + len { break; }
+                    }
+                }
+                stream.write_all(response.as_bytes()).unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            (endpoint, task)
+        }
+        let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        let body = r#"{"choices":[{"message":{"content":"你好"},"finish_reason":"stop"}]}"#;
+        let (endpoint, task) = serve(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()));
+        let result = tauri::async_runtime::block_on(translate_aliyun_at(&client, &endpoint, "dummy-test-key", "Hello", "中文"));
+        assert_eq!(result.unwrap(), "你好");
+        let request = task.join().unwrap();
+        assert!(request.to_ascii_lowercase().contains("authorization: bearer dummy-test-key"));
+        let json: serde_json::Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(json["model"], ALIYUN_MODEL);
+        assert_eq!(json["enable_thinking"], false);
+        assert_eq!(json["max_tokens"], 2048);
+        assert!(json["messages"][0]["content"].as_str().unwrap().contains("Hello"));
+        assert!(json.get("top_k").is_none());
+
+        let (endpoint, task) = serve("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into());
+        let error = tauri::async_runtime::block_on(translate_aliyun_at(&client, &endpoint, "dummy-test-key", "Hello", "中文")).unwrap_err();
+        assert!(error.contains("HTTP 429"));
+        assert!(!error.contains("dummy-test-key"));
+        task.join().unwrap();
+
+        let (endpoint, task) = serve("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into());
+        let error = tauri::async_runtime::block_on(translate_aliyun_at(&client, &endpoint, "dummy-test-key", "Hello", "中文")).unwrap_err();
+        assert!(error.contains("HTTP 302"));
+        task.join().unwrap();
     }
 }
 
@@ -241,7 +359,7 @@ fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> { app.cl
 
 #[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    let allowed = ["https://siliconflow.cn/", "https://cloud.siliconflow.cn/", "https://docs.siliconflow.cn/", "https://help.aliyun.com/", "https://mt.console.aliyun.com/", "https://openrouter.ai/", "https://ai.baidu.com/", "https://mymemory.translated.net/"];
+    let allowed = ["https://siliconflow.cn/", "https://cloud.siliconflow.cn/", "https://docs.siliconflow.cn/", "https://help.aliyun.com/", "https://mt.console.aliyun.com/", "https://bailian.console.aliyun.com/", "https://openrouter.ai/", "https://ai.baidu.com/", "https://mymemory.translated.net/"];
     if !allowed.iter().any(|base| url.starts_with(base)) { return Err("只能打开列出的官方服务页面".into()); }
     app.opener().open_url(url, None::<&str>).map_err(|e| format!("无法打开浏览器：{e}"))
 }
@@ -316,7 +434,7 @@ fn main() {
             });
             capture::set_enabled(settings.enabled);
             capture::set_excluded_apps(settings.excluded_apps.clone());
-            app.manage(AppState { settings: Mutex::new(settings), pending: Mutex::new(String::new()), credential_lock: Mutex::new(()), capture_error: Mutex::new(None), translation_ready: AtomicBool::new(false), translation_pending: AtomicBool::new(false), client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?, config_path });
+            app.manage(AppState { settings: Mutex::new(settings), pending: Mutex::new(String::new()), credential_lock: Mutex::new(()), capture_error: Mutex::new(None), translation_ready: AtomicBool::new(false), translation_pending: AtomicBool::new(false), client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?, aliyun_client: aliyun_http_client()?, config_path });
 
             WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("index.html?window=overlay".into()))
                 .title("一划").inner_size(48.0, 48.0).decorations(false).transparent(true).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).focused(false).build()?;
