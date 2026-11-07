@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "一划",
+  "version": "0.1.0",
+  "identifier": "com.wordglance.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1437",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{ "label": "main", "title": "一划 · 划词翻译", "width": 1060, "height": 760, "minWidth": 800, "minHeight": 620, "center": true }],
+    "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:" }
+  },
+  "bundle": { "active": true, "targets": "nsis", "icon": ["icons/icon.ico"] }
+}
