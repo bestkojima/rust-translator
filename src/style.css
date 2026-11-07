@@ -19,3 +19,18 @@
 .translation-languages select{min-width:88px;height:28px;padding:0 7px;border:1px solid #e3eae1;border-radius:7px;background:#f9fbf8;color:#355a41;font-size:12px;cursor:pointer}
 .translation-languages select:disabled{opacity:.6;cursor:default}
 .translation-languages select:focus-visible{outline:2px solid #95cbb0;outline-offset:1px}
+
+/* Provider avatars keep the same round silhouette everywhere they appear. */
+.provider-icon{width:42px;height:42px;border-radius:50%;font-size:18px;font-weight:700;line-height:1;color:#fff}
+.provider-icon img{display:block;width:23px;height:23px;object-fit:contain}
+.provider-avatar-aliyun{background:#b84f14}
+.provider-avatar-siliconflow{background:#237565}
+.provider-avatar-deepseek{background:#4167c4}
+.provider-avatar-openrouter{background:#f0e9ff}
+.provider-avatar-zhipu{background:#6456a7}
+.provider-avatar-moonshot{background:#e9f3ff}
+.provider-avatar-volcengine{background:#356db2}
+.provider-avatar-openai{background:#277568}
+.provider-avatar-gemini{background:#6958ad}
+.provider-avatar-anthropic{background:#9a6453}
+.provider-avatar-mymemory{background:#9c6a22}

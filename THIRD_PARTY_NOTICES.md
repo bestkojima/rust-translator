@@ -34,6 +34,13 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## 服务商品牌标识
+
+- OpenRouter 的原色小图标来自其[官方品牌素材](https://openrouter.ai/brand)，文件为 `src/assets/brands/openrouter-glyph.svg`。请按官方要求使用原色，不拉伸或改造。
+- Kimi 的原色 K 图标来自其[官方品牌指南](https://moonshotai.github.io/Branding-Guide/)，文件为 `src/assets/brands/kimi-k.svg`。
+
+上述品牌标识的权利归各自所有者，仅用于识别应用内支持的服务；其他服务使用文字头像。
+
 ## 其他依赖
 
 Rust 和 JavaScript 依赖及其版本分别由 `src-tauri/Cargo.lock` 和 `package-lock.json` 记录；各依赖使用各自的许可证。此文件列示直接改编的第三方源码，发布分发包前应一并处理依赖的许可要求。
