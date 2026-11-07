@@ -47,6 +47,7 @@ struct SettingsResponse {
     provider: String,
     source_language: String,
     model: String,
+    view_model: String,
     has_key: bool,
     credential_error: Option<String>,
     capture_error: Option<String>,
@@ -148,7 +149,8 @@ fn get_settings(state: State<'_, AppState>, provider: Option<String>) -> Result<
     };
     let capture_error = state.capture_error.lock().map_err(|_| "读取划词状态失败")?.clone();
     let model = selected_model(&settings, &settings.provider);
-    Ok(SettingsResponse { model, enabled: settings.enabled, excluded_apps: settings.excluded_apps, target_language: settings.target_language, provider: settings.provider, source_language: settings.source_language, has_key, credential_error, capture_error })
+    let view_model = selected_model(&settings, key_provider);
+    Ok(SettingsResponse { model, view_model, enabled: settings.enabled, excluded_apps: settings.excluded_apps, target_language: settings.target_language, provider: settings.provider, source_language: settings.source_language, has_key, credential_error, capture_error })
 }
 
 #[tauri::command]
