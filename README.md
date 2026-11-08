@@ -1,10 +1,29 @@
-# 一划 · Windows 划词翻译
+# 一划 · Wordglance
 
-在 Windows 上选中一段文字，点击旁边的翻译图标，即可查看译文。遇到无法读取选区的应用，可以打开主窗口，粘贴文字进行手动翻译。
+**选中文字，点一下，译文就在眼前。**
 
-## 安装与使用
+一划是一款 Windows 跨应用划词翻译工具。阅读网页、文档时，选中内容并点击划词图标，即可在浮窗里查看译文；也可以打开主窗口，粘贴文字进行翻译。
 
-从仓库的 Releases 页面下载 Windows x64 发布文件。安装包按提示安装后启动；若下载的是独立程序，放到固定位置后运行 `wordglance.exe`（压缩包需先解压）。需要 Windows 10/11 和 Microsoft Edge WebView2 Runtime。
+[![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-000000?logo=windows11&logoColor=white)](https://github.com/bestkojima/rust-translator/releases)
+[![Release](https://img.shields.io/github/v/release/bestkojima/rust-translator?include_prereleases&label=release&color=000000)](https://github.com/bestkojima/rust-translator/releases)
+[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Tauri](https://img.shields.io/badge/Tauri-2-000000?logo=tauri&logoColor=white)](https://v2.tauri.app/)
+
+[下载安装包](https://github.com/bestkojima/rust-translator/releases) · [服务商与费用](#服务商与费用) · [从源码运行](#从源码运行) · [Gitee 镜像](https://gitee.com/ddddr_wew/rust-translator)
+
+> 当前为测试版。安装包尚未签名；自动关闭、图钉、语言菜单和按需释放窗口仍需 Windows 实机联测。
+
+## 能做什么
+
+- **划词即译**：在支持的应用中选中文字，点击出现的图标查看译文；也支持手动粘贴翻译。
+- **译文浮窗**：切换原文和目标语言、复制译文；图钉可固定浮窗，默认切换到其他窗口后关闭。
+- **按需接入模型**：支持多个云端服务商，提供模型列表获取与手动输入模型 ID；支持流式输出的模型逐段显示译文。
+- **寻找免费接口**：内置免费接口发现入口；免费额度和服务价格以各平台当前规则为准。
+- **本机保存密钥**：各服务商的 API Key 分别存放在当前 Windows 用户的凭据管理器。
+
+## 安装与快速开始
+
+从 [Releases](https://github.com/bestkojima/rust-translator/releases) 下载 Windows x64 安装包，按提示安装并启动。需要 Windows 10/11 和 Microsoft Edge WebView2 Runtime。若使用独立程序，将 `wordglance.exe` 放到固定位置后运行（压缩包需先解压）。
 
 1. 启动应用，打开侧边栏「模型接口」，从列表选择服务：阿里云百炼、硅基流动、DeepSeek、智谱 AI、Kimi、火山方舟、OpenRouter、OpenAI、Google Gemini、Anthropic Claude，或免密的 MyMemory。
 2. 在服务详情页切换当前服务；使用云端模型时，在服务商控制台创建 API Key 并在应用中保存。各服务的 Key 分开存入当前 Windows 用户的凭据管理器。
@@ -15,6 +34,8 @@
 
 使用支持流式输出的云端模型时，译文会随着服务商返回的内容逐段显示。MyMemory 接口返回完整结果后再显示；不同服务和模型的响应速度取决于其接口与网络。
 
+## 服务商与费用
+
 硅基流动默认使用 `tencent/Hunyuan-MT-7B`。截至 2026 年 11 月 7 日，其[官方价格页](https://siliconflow.cn/pricing)将输入和输出标为免费；免费模型有速率限制，政策可能调整。申请和使用前请再次核对价格及账号条件。
 
 阿里云百炼默认使用北京地域的 `deepseek-v4.1-flash`，需使用该地域普通模型 API Key。请在[百炼免费额度页面](https://help.aliyun.com/zh/model-studio/new-free-quota)核对账号的模型额度和期限，并启用该模型的「免费额度用完即停」；额度耗尽或到期后可能转为按量收费。Coding Plan Key 不适用于本应用。
@@ -23,7 +44,7 @@ MyMemory 匿名额度为每天 5,000 字符、每次最多 500 UTF-8 字节和�
 
 「免费接口发现」提供硅基流动、阿里云和 OpenRouter 的官方入口。OpenRouter 的「刷新免费模型」读取公开模型目录，列出符合当前免费条件的文本模型。云端服务返回的模型列表可能包含收费模型或非文本模型，获取列表本身不会翻译；使用前请在对应平台核对模型权限、价格和免费额度。
 
-## 开发运行
+## 从源码运行
 
 系统与工具：
 
@@ -86,7 +107,7 @@ rust-translator/
 
 ## 当前验证状态
 
-Windows 跨应用选词、图标和译文浮窗已有用户实机使用反馈。当前代码中的自动关闭、图钉、语言菜单以及按需释放窗口已通过构建和自动测试，仍待 Windows 实机联测；内存优化幅度也有待新版运行后测量。不同服务商、模型及目标应用的兼容性可能有所不同。
+Windows 跨应用选词、图标和译文浮窗已有用户实机使用反馈。当前代码中的自动关闭、图钉、语言菜单以及按需释放窗口已通过构建和自动测试，仍待 Windows 实机联测；不同服务商、模型及目标应用的兼容性可能有所不同。
 
 ## 第三方代码
 
