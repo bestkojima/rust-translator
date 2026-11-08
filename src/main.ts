@@ -70,6 +70,7 @@ let page: Page = 'translate';
 let autostartStatus: AutostartStatus = 'disabled';
 let autostartBusy = true;
 let autostartInFlight = false;
+let autostartRefreshPending = false;
 let autostartMessage = '';
 let autostartError = false;
 let detailProvider: Provider | null = null;
@@ -286,7 +287,7 @@ function updateAutostartView() {
   message.textContent = autostartMessage;
 }
 async function refreshAutostart() {
-  if (autostartInFlight) { updateAutostartView(); return; }
+  if (autostartInFlight) { autostartRefreshPending = true; return; }
   autostartBusy = true; autostartError = false;
   autostartMessage = isTauri ? '正在读取 Windows 启动项…' : '请在桌面应用中设置'; updateAutostartView();
   if (!isTauri) return;
@@ -294,8 +295,9 @@ async function refreshAutostart() {
   try {
     autostartStatus = await call<AutostartStatus>('get_autostart_status');
     autostartMessage = autostartStatus === 'stale' ? '启动项指向旧位置，请关闭后重新开启以更新路径。' : autostartStatus === 'blocked' ? 'Windows 已禁用此启动项，请在 Windows 设置 → 应用 → 启动中允许。' : '';
-  } catch (error) { autostartInFlight = false; autostartError = true; autostartMessage = '读取失败，请重新进入设置重试：' + errorMessage(error); updateAutostartView(); return; }
+  } catch (error) { autostartInFlight = false; autostartError = true; autostartMessage = '读取失败，请重新进入设置重试：' + errorMessage(error); updateAutostartView(); if (autostartRefreshPending) { autostartRefreshPending = false; void refreshAutostart(); } return; }
   autostartInFlight = false; autostartBusy = false; updateAutostartView();
+  if (autostartRefreshPending) { autostartRefreshPending = false; void refreshAutostart(); }
 }
 async function changeAutostart(enabled: boolean) {
   if (autostartInFlight) return;
@@ -306,10 +308,11 @@ async function changeAutostart(enabled: boolean) {
   } catch (error) {
     const reason = errorMessage(error);
     try { autostartStatus = await call<AutostartStatus>('get_autostart_status'); }
-    catch { autostartInFlight = false; autostartBusy = true; autostartError = true; autostartMessage = '更新失败，且无法读取启动项：' + reason; updateAutostartView(); return; }
+    catch { autostartInFlight = false; autostartBusy = true; autostartError = true; autostartMessage = '更新失败，且无法读取启动项：' + reason; updateAutostartView(); if (autostartRefreshPending) { autostartRefreshPending = false; void refreshAutostart(); } return; }
     autostartError = true; autostartMessage = '更新失败：' + reason;
   }
   autostartInFlight = false; autostartBusy = false; updateAutostartView();
+  if (autostartRefreshPending) { autostartRefreshPending = false; void refreshAutostart(); }
 }
 function go(next: Page) { page = next; detailGeneration++; detailProvider = null; detailSettings = null; detailLoading = false; detailError = ''; renderMain(); if (next === 'settings') void refreshAutostart(); window.scrollTo(0, 0); }
 async function openProvider(provider: Provider) {
@@ -644,6 +647,8 @@ async function bootstrap() {
   document.addEventListener('visibilitychange', () => { if (document.hidden) { stopManual(); updateManualView(); } });
   app.addEventListener('input', event => { const target = event.target as HTMLInputElement; if (target.id === 'workspace-id') workspaceId = target.value; if (target.id === 'manual-text') manualDraft = target.value; });
   if (isTauri) {
+    try { await listen('autostart-changed', () => { if (page === 'settings') void refreshAutostart(); }); }
+    catch (error) { notify(`无法同步开机启动状态：${errorMessage(error)}`, 'error'); }
     try { await listen<number>('prepare-main-close', event => { void closeMainWithDraft(event.payload); }); }
     catch (error) { notify(`无法启用窗口关闭：${errorMessage(error)}`, 'error'); }
   }

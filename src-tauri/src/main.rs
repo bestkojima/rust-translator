@@ -7,7 +7,7 @@ mod streaming;
 use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}}, time::Duration};
 use tauri::{Emitter, Manager, PhysicalPosition, Position, State, WebviewUrl, WebviewWindowBuilder};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
@@ -835,10 +835,81 @@ fn get_autostart_status(window: tauri::WebviewWindow) -> Result<autostart::Statu
     autostart::status()
 }
 
+struct TrayAutostart {
+    item: CheckMenuItem<tauri::Wry>,
+    operations: Mutex<()>,
+}
+
+fn autostart_menu_presentation(status: Option<&autostart::Status>) -> (&'static str, bool) {
+    match status {
+        Some(autostart::Status::Disabled) => ("开机自动启动", false),
+        Some(autostart::Status::Enabled) => ("开机自动启动", true),
+        Some(autostart::Status::Stale) => ("开机自动启动（路径已变更）", true),
+        Some(autostart::Status::Blocked) => ("开机自动启动（Windows 已禁用）", true),
+        None => ("开机自动启动（读取失败）", false),
+    }
+}
+
+#[cfg(test)]
+mod autostart_menu_tests {
+    use super::{autostart::Status, autostart_menu_presentation};
+
+    #[test]
+    fn reflects_real_startup_status_in_tray() {
+        assert_eq!(autostart_menu_presentation(Some(&Status::Disabled)), ("开机自动启动", false));
+        assert_eq!(autostart_menu_presentation(Some(&Status::Enabled)), ("开机自动启动", true));
+        assert_eq!(autostart_menu_presentation(Some(&Status::Stale)), ("开机自动启动（路径已变更）", true));
+        assert_eq!(autostart_menu_presentation(Some(&Status::Blocked)), ("开机自动启动（Windows 已禁用）", true));
+        assert_eq!(autostart_menu_presentation(None), ("开机自动启动（读取失败）", false));
+    }
+}
+
+// Run on a worker: Tauri dispatches menu mutations to the main thread.
+fn update_autostart_menu(app: &tauri::AppHandle, status: Option<&autostart::Status>) {
+    if let Some(item) = app.try_state::<TrayAutostart>() {
+        let (label, checked) = autostart_menu_presentation(status);
+        if let Err(error) = item.item.set_text(label).and_then(|_| item.item.set_checked(checked)) {
+            eprintln!("更新托盘启动菜单失败：{error}");
+        }
+    }
+}
+
+fn autostart_dialog(message: &str) {
+    use windows::{core::PCWSTR, Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK}};
+    let message: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = "一划 · 开机自动启动".encode_utf16().chain(Some(0)).collect();
+    unsafe { MessageBoxW(None, PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONWARNING); }
+}
+
+fn toggle_autostart_from_tray(app: &tauri::AppHandle) {
+    let tray = app.state::<TrayAutostart>();
+    let Ok(_guard) = tray.operations.lock() else { autostart_dialog("无法更新开机启动，请重试。"); return; };
+    let result = autostart::status().and_then(|status| autostart::set_enabled(status == autostart::Status::Disabled));
+    match result {
+        Ok(status) => {
+            update_autostart_menu(app, Some(&status));
+            let _ = app.emit("autostart-changed", ());
+            if status == autostart::Status::Blocked {
+                autostart_dialog("Windows 已禁用此启动项，请在 Windows 设置 → 应用 → 启动中允许一划。");
+            }
+        }
+        Err(error) => {
+            let status = autostart::status().ok();
+            update_autostart_menu(app, status.as_ref());
+            let _ = app.emit("autostart-changed", ());
+            autostart_dialog(&format!("无法更新开机启动：{error}"));
+        }
+    }
+}
+
 #[tauri::command]
-fn set_autostart_enabled(window: tauri::WebviewWindow, enabled: bool) -> Result<autostart::Status, String> {
+async fn set_autostart_enabled(window: tauri::WebviewWindow, enabled: bool) -> Result<autostart::Status, String> {
     if window.label() != "main" { return Err("窗口无权修改开机启动设置".into()); }
-    autostart::set_enabled(enabled)
+    let tray = window.app_handle().state::<TrayAutostart>();
+    let _guard = tray.operations.lock().map_err(|_| "无法更新开机启动，请重试")?;
+    let status = autostart::set_enabled(enabled)?;
+    update_autostart_menu(window.app_handle(), Some(&status));
+    Ok(status)
 }
 
 #[tauri::command]
@@ -1188,11 +1259,33 @@ fn main() {
             // Resize once after creation so Windows' default minimum cannot enlarge the bubble.
             overlay.set_size(tauri::LogicalSize::new(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64))?;
             let show = MenuItem::with_id(app, "show", "打开一划", true, None::<&str>)?;
+            let status = autostart::status().ok();
+            let (label, checked) = autostart_menu_presentation(status.as_ref());
+            let autostart_item = CheckMenuItem::with_id(app, "autostart", label, true, checked, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &autostart_item, &quit])?;
+            app.manage(TrayAutostart { item: autostart_item, operations: Mutex::new(()) });
             let mut tray = TrayIconBuilder::new().tooltip("一划 · 划词翻译").menu(&menu)
-                .on_menu_event(|app, event| match event.id.as_ref() { "show" => { let handle = app.clone(); tauri::async_runtime::spawn(async move { if let Err(error) = show_main_impl(&handle).await { eprintln!("打开主窗口失败：{error}"); } }); }, "quit" => app.exit(0), _ => {} })
-                .on_tray_icon_event(|tray, event| { if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event { let handle = tray.app_handle().clone(); tauri::async_runtime::spawn(async move { if let Err(error) = show_main_impl(&handle).await { eprintln!("打开主窗口失败：{error}"); } }); } });
+                .on_menu_event(|app, event| match event.id.as_ref() { "show" => { let handle = app.clone(); tauri::async_runtime::spawn(async move { if let Err(error) = show_main_impl(&handle).await { eprintln!("打开主窗口失败：{error}"); } }); }, "autostart" => { let handle = app.clone(); tauri::async_runtime::spawn(async move { toggle_autostart_from_tray(&handle); }); }, "quit" => app.exit(0), _ => {} })
+                .on_tray_icon_event(|tray, event| {
+                    match event {
+                        TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => {
+                            let handle = tray.app_handle().clone();
+                            tauri::async_runtime::spawn(async move { if let Err(error) = show_main_impl(&handle).await { eprintln!("打开主窗口失败：{error}"); } });
+                        }
+                        TrayIconEvent::Click { button: MouseButton::Right, button_state: MouseButtonState::Down, .. } => {
+                            let handle = tray.app_handle().clone();
+                            tauri::async_runtime::spawn(async move {
+                                let tray = handle.state::<TrayAutostart>();
+                                if let Ok(_guard) = tray.operations.lock() {
+                                    let status = autostart::status().ok();
+                                    update_autostart_menu(&handle, status.as_ref());
+                                };
+                            });
+                        }
+                        _ => {}
+                    }
+                });
             if let Some(icon) = app.default_window_icon() { tray = tray.icon(icon.clone()); }
             tray.build(app)?;
             let handle = app.handle().clone();
