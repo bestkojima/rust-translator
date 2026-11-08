@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod capture;
 mod streaming;
 
@@ -829,6 +830,18 @@ async fn show_main_impl(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_autostart_status(window: tauri::WebviewWindow) -> Result<autostart::Status, String> {
+    if window.label() != "main" { return Err("窗口无权读取开机启动设置".into()); }
+    autostart::status()
+}
+
+#[tauri::command]
+fn set_autostart_enabled(window: tauri::WebviewWindow, enabled: bool) -> Result<autostart::Status, String> {
+    if window.label() != "main" { return Err("窗口无权修改开机启动设置".into()); }
+    autostart::set_enabled(enabled)
+}
+
+#[tauri::command]
 async fn show_main(app: tauri::AppHandle) -> Result<(), String> { show_main_impl(&app).await }
 
 #[tauri::command]
@@ -1102,12 +1115,56 @@ mod placement_tests {
     }
 }
 
+async fn wait_for_startup(mut ready: tokio::sync::watch::Receiver<bool>) -> bool {
+    while !*ready.borrow_and_update() {
+        if ready.changed().await.is_err() { return false; }
+    }
+    true
+}
+
+#[cfg(test)]
+mod startup_ready_tests {
+    use super::wait_for_startup;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_request_waits_beyond_two_seconds_and_survives_early_readiness() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let pending = tokio::spawn(wait_for_startup(rx.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        assert!(!pending.is_finished());
+        tx.send_replace(true);
+        assert!(pending.await.unwrap());
+        assert!(wait_for_startup(rx).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_initialization_unblocks_pending_open() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        assert!(!wait_for_startup(rx).await);
+    }
+}
+
 fn main() {
     if let Ok(store) = windows_native_keyring_store::Store::new() { keyring_core::set_default_store(store); }
+    let autostart_launch = std::env::args_os().any(|arg| arg == autostart::ARGUMENT);
+    let mut context = tauri::generate_context!();
+    if autostart_launch { context.config_mut().app.windows.retain(|window| window.label != "main"); }
+    let (startup_ready_tx, startup_ready_rx) = tokio::sync::watch::channel(false);
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(move |app, args, _cwd| {
+            if args.iter().any(|arg| arg == autostart::ARGUMENT) { return; }
+            let handle = app.clone();
+            let ready = startup_ready_rx.clone();
+            tauri::async_runtime::spawn(async move {
+                // A manual reopen remains pending until setup completes; never block WM_COPYDATA.
+                if !wait_for_startup(ready).await { eprintln!("启动未完成，无法打开主窗口"); return; }
+                if let Err(error) = show_main_impl(&handle).await { eprintln!("打开主窗口失败：{error}"); }
+            });
+        }))
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
+        .setup(move |app| {
             let config_path = app.path().app_config_dir()?.join("settings.json");
             let settings: Settings = fs::read(&config_path).ok().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_else(|| {
                 let mut settings = Settings::default();
@@ -1153,6 +1210,7 @@ fn main() {
                     capture::CaptureEvent::Dismiss => { if let Some(window) = handle.get_webview_window("overlay") { let _ = window.hide(); } }
                 }
             }) { *app.state::<AppState>().capture_error.lock().unwrap() = Some(error); }
+            startup_ready_tx.send_replace(true);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1197,7 +1255,7 @@ fn main() {
                 _ => { let _ = window.hide(); },
             }
         } })
-        .invoke_handler(tauri::generate_handler![get_settings, save_settings, save_model, fetch_models, set_api_key, clear_api_key, translate_text, translate_stream, cancel_translation, refresh_free_models, get_pending_selection, copy_text, open_url, show_main, take_main_snapshot, close_main, dismiss_overlay, set_translation_pinned, translation_auto_close_available, open_translation, translation_ready])
-        .run(tauri::generate_context!())
+        .invoke_handler(tauri::generate_handler![get_autostart_status, set_autostart_enabled, get_settings, save_settings, save_model, fetch_models, set_api_key, clear_api_key, translate_text, translate_stream, cancel_translation, refresh_free_models, get_pending_selection, copy_text, open_url, show_main, take_main_snapshot, close_main, dismiss_overlay, set_translation_pinned, translation_auto_close_available, open_translation, translation_ready])
+        .run(context)
         .expect("启动一划失败");
 }

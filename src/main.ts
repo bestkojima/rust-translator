@@ -12,6 +12,7 @@ type StreamChunk = { request_id: string; delta: string };
 type StreamRequest = { id: string; cancelled: boolean; started: boolean; unlisten?: () => void };
 type TranslationLanguages = { sourceLanguage: string; targetLanguage: string; expectedProvider: Provider };
 type Page = 'translate' | 'providers' | 'discover' | 'settings';
+type AutostartStatus = 'disabled' | 'enabled' | 'stale' | 'blocked';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 const windowKind = new URLSearchParams(location.search).get('window') || 'main';
@@ -66,6 +67,11 @@ const cloudProviders: Record<CloudProvider, ProviderInfo> = {
 };
 let settings: Settings = { enabled: true, excluded_apps: [], has_key: false, provider: 'siliconflow', model: 'tencent/Hunyuan-MT-7B', view_model: 'tencent/Hunyuan-MT-7B', source_language: 'en', target_language: 'zh' };
 let page: Page = 'translate';
+let autostartStatus: AutostartStatus = 'disabled';
+let autostartBusy = true;
+let autostartInFlight = false;
+let autostartMessage = '';
+let autostartError = false;
 let detailProvider: Provider | null = null;
 let detailSettings: Settings | null = null;
 let detailLoading = false;
@@ -141,6 +147,7 @@ function stopManual() {
 function snapshotMain(): MainSnapshot {
   const fields: MainSnapshot['fields'] = {};
   document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('input[id], textarea[id], select[id]').forEach(element => {
+    if (element.id === 'autostart') return;
     fields[element.id] = { value: element.value, ...(element instanceof HTMLInputElement && (element.type === 'checkbox' || element.type === 'radio') ? { checked: element.checked } : {}) };
   });
   return { page, detailProvider, manualDraft, manualResult, manualStatus, workspaceId, freeModels, modelsLoaded, availableModels, fields, scrollY: window.scrollY };
@@ -162,6 +169,7 @@ async function restoreMain(snapshot: MainSnapshot | null) {
   if (page === 'providers' && snapshot.detailProvider) await openProvider(snapshot.detailProvider);
   else renderMain();
   for (const [id, field] of Object.entries(snapshot.fields || {})) {
+    if (id === 'autostart') continue;
     const element = document.getElementById(id);
     if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
       element.value = field.value;
@@ -261,13 +269,49 @@ function modelList() {
 }
 function settingsPage() {
   const options = (selected: string) => `<option value="en" ${selected === 'en' ? 'selected' : ''}>英语</option><option value="zh" ${selected === 'zh' ? 'selected' : ''}>中文</option><option value="ja" ${selected === 'ja' ? 'selected' : ''}>日语</option>`;
-  return `<div class="page-head"><div><div class="eyebrow">MAKE IT YOURS</div><h1>安静地，<span>刚刚好。</span></h1><p class="lead">把划词体验调整成适合你的样子。</p></div><span class="top-status">${statusMarkup()}</span></div>${captureWarning()}<section class="settings-card"><div class="setting-row"><div><h3>自动划词</h3><p>选中文字后显示翻译图标。暂停后仍可手动翻译。</p></div><label class="switch"><input type="checkbox" id="enabled" ${settings.enabled ? 'checked' : ''}/><span></span><span class="sr-only">开启自动划词</span></label></div><div class="setting-row column"><div><h3>排除应用</h3><p>在不希望显示图标的程序中暂停划词，每行一个程序名，例如 <code>Code.exe</code>。</p></div><label class="sr-only" for="excluded-apps">排除应用，每行一个</label><textarea id="excluded-apps" rows="4" placeholder="例如：&#10;WindowsTerminal.exe&#10;KeePass.exe">${escapeHtml(settings.excluded_apps.join('\n'))}</textarea></div><div class="setting-row column"><div><h3>原文语言</h3><p>MyMemory 使用所选原文语言；大模型会根据文本识别语言。</p></div><label class="sr-only" for="source-language">原文语言</label><select id="source-language">${options(settings.source_language)}</select></div><div class="setting-row column"><div><h3>目标语言</h3><p>选择翻译结果使用的语言；使用 MyMemory 时请与原文语言选不同的语言。</p></div><label class="sr-only" for="target-language">目标语言</label><select id="target-language">${options(settings.target_language)}</select></div><div class="settings-actions"><button class="button primary" data-action="save-settings">保存设置</button></div></section><div class="privacy-note"><span>✳</span><div><strong>你的选择，你来决定。</strong><p>应用会在本机读取选中文本以显示图标；点击翻译时，原文才会发送到已配置的翻译服务。</p></div></div>`;
+  return `<div class="page-head"><div><div class="eyebrow">MAKE IT YOURS</div><h1>安静地，<span>刚刚好。</span></h1><p class="lead">把划词体验调整成适合你的样子。</p></div><span class="top-status">${statusMarkup()}</span></div>${captureWarning()}<section class="settings-card"><div class="setting-row"><div><h3>开机自动启动</h3><p>登录 Windows 后在后台启动，可从系统托盘打开一划。</p><p id="autostart-message" role="status" aria-live="polite"></p></div><label class="switch"><input type="checkbox" id="autostart" disabled/><span></span><span class="sr-only">开机自动启动</span></label></div><div class="setting-row"><div><h3>自动划词</h3><p>选中文字后显示翻译图标。暂停后仍可手动翻译。</p></div><label class="switch"><input type="checkbox" id="enabled" ${settings.enabled ? 'checked' : ''}/><span></span><span class="sr-only">开启自动划词</span></label></div><div class="setting-row column"><div><h3>排除应用</h3><p>在不希望显示图标的程序中暂停划词，每行一个程序名，例如 <code>Code.exe</code>。</p></div><label class="sr-only" for="excluded-apps">排除应用，每行一个</label><textarea id="excluded-apps" rows="4" placeholder="例如：&#10;WindowsTerminal.exe&#10;KeePass.exe">${escapeHtml(settings.excluded_apps.join('\n'))}</textarea></div><div class="setting-row column"><div><h3>原文语言</h3><p>MyMemory 使用所选原文语言；大模型会根据文本识别语言。</p></div><label class="sr-only" for="source-language">原文语言</label><select id="source-language">${options(settings.source_language)}</select></div><div class="setting-row column"><div><h3>目标语言</h3><p>选择翻译结果使用的语言；使用 MyMemory 时请与原文语言选不同的语言。</p></div><label class="sr-only" for="target-language">目标语言</label><select id="target-language">${options(settings.target_language)}</select></div><div class="settings-actions"><button class="button primary" data-action="save-settings">保存设置</button></div></section><div class="privacy-note"><span>✳</span><div><strong>你的选择，你来决定。</strong><p>应用会在本机读取选中文本以显示图标；点击翻译时，原文才会发送到已配置的翻译服务。</p></div></div>`;
 }
 function renderMain() {
   stopManual();
   app.innerHTML = `<div class="app-shell">${navigation()}<main class="main-content"><div class="main-inner">${page === 'translate' ? mainPage() : page === 'providers' ? providersPage() : page === 'discover' ? discoverPage() : settingsPage()}</div><footer class="footer"><span>读得专注，想得更远。</span><span>YIHUA / 一划</span></footer></main></div><div id="toast" class="toast" role="status" aria-live="polite"></div>${!isTauri ? '<div class="preview-badge">浏览器预览</div>' : ''}`;
+  if (page === 'settings') updateAutostartView();
 }
-function go(next: Page) { page = next; detailGeneration++; detailProvider = null; detailSettings = null; detailLoading = false; detailError = ''; renderMain(); window.scrollTo(0, 0); }
+function updateAutostartView() {
+  const input = document.querySelector<HTMLInputElement>('#autostart');
+  const message = document.querySelector<HTMLParagraphElement>('#autostart-message');
+  if (!input || !message) return;
+  input.checked = autostartStatus !== 'disabled';
+  input.disabled = autostartBusy || !isTauri;
+  message.classList.toggle('error', autostartError);
+  message.textContent = autostartMessage;
+}
+async function refreshAutostart() {
+  if (autostartInFlight) { updateAutostartView(); return; }
+  autostartBusy = true; autostartError = false;
+  autostartMessage = isTauri ? '正在读取 Windows 启动项…' : '请在桌面应用中设置'; updateAutostartView();
+  if (!isTauri) return;
+  autostartInFlight = true;
+  try {
+    autostartStatus = await call<AutostartStatus>('get_autostart_status');
+    autostartMessage = autostartStatus === 'stale' ? '启动项指向旧位置，请关闭后重新开启以更新路径。' : autostartStatus === 'blocked' ? 'Windows 已禁用此启动项，请在 Windows 设置 → 应用 → 启动中允许。' : '';
+  } catch (error) { autostartInFlight = false; autostartError = true; autostartMessage = '读取失败，请重新进入设置重试：' + errorMessage(error); updateAutostartView(); return; }
+  autostartInFlight = false; autostartBusy = false; updateAutostartView();
+}
+async function changeAutostart(enabled: boolean) {
+  if (autostartInFlight) return;
+  autostartInFlight = true; autostartBusy = true; autostartMessage = '正在更新 Windows 启动项…'; autostartError = false; updateAutostartView();
+  try {
+    autostartStatus = await call<AutostartStatus>('set_autostart_enabled', { enabled });
+    autostartMessage = autostartStatus === 'blocked' ? 'Windows 已禁用此启动项，请在 Windows 设置 → 应用 → 启动中允许。' : autostartStatus === 'stale' ? '启动项指向旧位置，请关闭后重新开启以更新路径。' : enabled ? '已开启，登录时静默启动。' : '已关闭开机启动。';
+  } catch (error) {
+    const reason = errorMessage(error);
+    try { autostartStatus = await call<AutostartStatus>('get_autostart_status'); }
+    catch { autostartInFlight = false; autostartBusy = true; autostartError = true; autostartMessage = '更新失败，且无法读取启动项：' + reason; updateAutostartView(); return; }
+    autostartError = true; autostartMessage = '更新失败：' + reason;
+  }
+  autostartInFlight = false; autostartBusy = false; updateAutostartView();
+}
+function go(next: Page) { page = next; detailGeneration++; detailProvider = null; detailSettings = null; detailLoading = false; detailError = ''; renderMain(); if (next === 'settings') void refreshAutostart(); window.scrollTo(0, 0); }
 async function openProvider(provider: Provider) {
   const generation = ++detailGeneration;
   detailProvider = provider; detailSettings = null; detailError = ''; detailLoading = true;
@@ -594,7 +638,9 @@ async function bootstrap() {
     catch (error) { loadError = `无法恢复窗口状态：${errorMessage(error)}`; }
   }
   try { settings = await call<Settings>('get_settings'); } catch (error) { loadError = `无法读取应用状态：${errorMessage(error)}`; }
-  await restoreMain(snapshot); app.addEventListener('click', event => { void handleMainClick(event); });
+  await restoreMain(snapshot); if (page === 'settings') void refreshAutostart();
+  app.addEventListener('change', event => { const input = event.target as HTMLInputElement; if (input.id === 'autostart' && !autostartBusy) void changeAutostart(input.checked); });
+  app.addEventListener('click', event => { void handleMainClick(event); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) { stopManual(); updateManualView(); } });
   app.addEventListener('input', event => { const target = event.target as HTMLInputElement; if (target.id === 'workspace-id') workspaceId = target.value; if (target.id === 'manual-text') manualDraft = target.value; });
   if (isTauri) {
