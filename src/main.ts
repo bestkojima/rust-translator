@@ -1,11 +1,13 @@
 import './style.css';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { escapeLanguageMenu, languageChanged, moveLanguageOption, toggleLanguageMenu, type LanguageMenu } from './language-menu';
 
 type Provider = 'mymemory' | 'siliconflow' | 'aliyun' | 'deepseek' | 'openrouter' | 'openai' | 'zhipu' | 'moonshot' | 'gemini' | 'anthropic' | 'volcengine';
 type Settings = { enabled: boolean; excluded_apps: string[]; has_key: boolean; provider: Provider; model: string; view_model: string; source_language: string; target_language: string; capture_error?: string | null; credential_error?: string | null };
 type FreeModel = { id: string; name: string };
-type SelectionEvent = { text?: string };
+type SelectionEvent = { text?: string; sequence?: number };
+type MainSnapshot = { page: Page; detailProvider: Provider | null; manualDraft: string; manualResult: string; manualStatus: string; workspaceId: string; freeModels: FreeModel[]; modelsLoaded: boolean; availableModels: Partial<Record<Provider, FreeModel[]>>; fields: Record<string, { value: string; checked?: boolean }>; scrollY: number };
 type StreamChunk = { request_id: string; delta: string };
 type StreamRequest = { id: string; cancelled: boolean; started: boolean; unlisten?: () => void };
 type TranslationLanguages = { sourceLanguage: string; targetLanguage: string; expectedProvider: Provider };
@@ -13,6 +15,7 @@ type Page = 'translate' | 'providers' | 'discover' | 'settings';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 const windowKind = new URLSearchParams(location.search).get('window') || 'main';
+const windowGeneration = Number(new URLSearchParams(location.search).get('generation')) || undefined;
 const isTauri = '__TAURI_INTERNALS__' in window;
 const providerLogos: Partial<Record<Provider, string>> = {
   openrouter: new URL('./assets/brands/openrouter-glyph.svg', import.meta.url).href,
@@ -28,6 +31,7 @@ const icons = {
   external: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M13 5h6v6M19 5l-8 8m5 1v4H6V8h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   copy: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" stroke="currentColor" stroke-width="1.6"/></svg>',
   close: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+  pin: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 4 6 0-.5 4 3 3v1.5h-4.7L12 20l-.8-7.5H6.5V11l3-3L9 4Z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
 };
 const urls = {
   siliconSignup: 'https://cloud.siliconflow.cn/', siliconPrice: 'https://siliconflow.cn/pricing',
@@ -71,6 +75,7 @@ let freeModels: FreeModel[] = [];
 let modelsLoaded = false;
 let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 let selectionGeneration = 0;
+let latestSelectionSequence = 0;
 let lastResult = '';
 let lastSource = '';
 let loadError = '';
@@ -83,6 +88,9 @@ let streamSerial = 0;
 let manualRequest: StreamRequest | undefined;
 let selectionRequest: StreamRequest | undefined;
 let selectionRunning = false;
+let selectionPinned = false;
+let languageMenu: LanguageMenu = null;
+let activeLanguageIndex = 0;
 let selectionSettings: Settings | null = null;
 let selectionSourceLanguage = 'auto';
 let selectionTargetLanguage = 'zh';
@@ -101,7 +109,7 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
   throw new Error('浏览器预览模式：请在桌面应用中使用此功能');
 }
 function newStreamRequest(): StreamRequest {
-  return { id: `${windowKind}-${Date.now().toString(36)}-${(++streamSerial).toString(36)}`, cancelled: false, started: false };
+  return { id: `${windowKind}-${windowGeneration || 0}-${Date.now().toString(36)}-${(++streamSerial).toString(36)}`, cancelled: false, started: false };
 }
 function cancelStream(request: StreamRequest | undefined) {
   if (!request || request.cancelled) return;
@@ -117,7 +125,7 @@ async function runStream(text: string, request: StreamRequest, onChunk: (delta: 
   if (request.cancelled) { request.unlisten(); request.unlisten = undefined; return; }
   try {
     request.started = true;
-    return await call<string>('translate_stream', { text, requestId: request.id, ...languages });
+    return await call<string>('translate_stream', { text, requestId: request.id, windowGeneration, ...languages });
   } finally {
     request.unlisten?.(); request.unlisten = undefined;
   }
@@ -126,6 +134,41 @@ function stopManual() {
   if (!manualRequest) return;
   cancelStream(manualRequest); manualRequest = undefined; manualWorking = false;
   manualStatus = '已停止翻译';
+}
+
+// Only in-process Rust memory retains these unsaved fields while the main webview
+// is closed; they are never written to disk. This includes an unsaved API key.
+function snapshotMain(): MainSnapshot {
+  const fields: MainSnapshot['fields'] = {};
+  document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('input[id], textarea[id], select[id]').forEach(element => {
+    fields[element.id] = { value: element.value, ...(element instanceof HTMLInputElement && (element.type === 'checkbox' || element.type === 'radio') ? { checked: element.checked } : {}) };
+  });
+  return { page, detailProvider, manualDraft, manualResult, manualStatus, workspaceId, freeModels, modelsLoaded, availableModels, fields, scrollY: window.scrollY };
+}
+let mainClosePending = false;
+async function closeMainWithDraft(closeId: number) {
+  if (mainClosePending) return;
+  mainClosePending = true;
+  stopManual();
+  try { await call('close_main', { snapshot: snapshotMain(), closeId }); }
+  catch (error) { mainClosePending = false; notify(`关闭窗口失败：${errorMessage(error)}`, 'error'); }
+}
+async function restoreMain(snapshot: MainSnapshot | null) {
+  if (!snapshot) { renderMain(); return; }
+  manualDraft = snapshot.manualDraft || ''; manualResult = snapshot.manualResult || ''; manualStatus = snapshot.manualStatus || '';
+  workspaceId = snapshot.workspaceId || ''; freeModels = snapshot.freeModels || []; modelsLoaded = !!snapshot.modelsLoaded;
+  Object.assign(availableModels, snapshot.availableModels || {});
+  page = snapshot.page;
+  if (page === 'providers' && snapshot.detailProvider) await openProvider(snapshot.detailProvider);
+  else renderMain();
+  for (const [id, field] of Object.entries(snapshot.fields || {})) {
+    const element = document.getElementById(id);
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
+      element.value = field.value;
+      if (element instanceof HTMLInputElement && field.checked !== undefined) element.checked = field.checked;
+    }
+  }
+  window.scrollTo(0, snapshot.scrollY || 0);
 }
 function stopSelection(showStatus = false) {
   selectionGeneration++;
@@ -379,37 +422,103 @@ function renderOverlay() {
   app.innerHTML = `<button id="translate-bubble" class="translate-bubble" aria-label="翻译选中文字" title="翻译选中文字">${icons.translate}</button><div id="toast" class="toast overlay-toast" role="status"></div>`;
   document.querySelector('#translate-bubble')?.addEventListener('click', async () => { try { await call('open_translation'); } catch (error) { notify(errorMessage(error), 'error'); } });
 }
+type LanguagePicker = Exclude<LanguageMenu, null>;
+const translationLanguages = [{ value: 'zh', label: '中文' }, { value: 'en', label: '英语' }, { value: 'ja', label: '日语' }];
+function languageOptions(kind: LanguagePicker) {
+  return kind === 'source' && selectionSettings?.provider !== 'mymemory'
+    ? [{ value: 'auto', label: '自动检测' }, ...translationLanguages] : translationLanguages;
+}
+function pickerValue(kind: LanguagePicker) { return kind === 'source' ? selectionSourceLanguage : selectionTargetLanguage; }
+function syncLanguageMenu() {
+  for (const kind of ['source', 'target'] as const) {
+    const trigger = requireElement<HTMLButtonElement>(`#translation-${kind}-language`);
+    const list = requireElement<HTMLElement>(`#translation-${kind}-list`);
+    const isOpen = languageMenu === kind;
+    trigger.setAttribute('aria-expanded', String(isOpen));
+    list.hidden = !isOpen;
+    if (isOpen) trigger.setAttribute('aria-activedescendant', `translation-${kind}-option-${activeLanguageIndex}`);
+    else trigger.removeAttribute('aria-activedescendant');
+    list.querySelectorAll<HTMLElement>('[role=option]').forEach((option, index) => { option.dataset.active = String(isOpen && index === activeLanguageIndex); });
+  }
+}
+function setLanguageMenu(menu: LanguageMenu) {
+  languageMenu = menu;
+  if (menu) activeLanguageIndex = Math.max(0, languageOptions(menu).findIndex(option => option.value === pickerValue(menu)));
+  syncLanguageMenu();
+}
 function updateTranslationLanguages() {
-  const source = requireElement<HTMLSelectElement>('#translation-source-language');
-  const target = requireElement<HTMLSelectElement>('#translation-target-language');
-  const languages = [['zh', '中文'], ['en', '英语'], ['ja', '日语']];
-  const option = ([value, name]: string[]) => `<option value="${value}">${name}</option>`;
-  source.innerHTML = `${selectionSettings?.provider === 'mymemory' ? '' : '<option value="auto">自动检测</option>'}${languages.map(option).join('')}`;
-  target.innerHTML = languages.map(option).join('');
-  source.value = selectionSourceLanguage;
-  target.value = selectionTargetLanguage;
-  source.disabled = !selectionSettings;
-  target.disabled = !selectionSettings;
+  languageMenu = null;
+  for (const kind of ['source', 'target'] as const) {
+    const trigger = requireElement<HTMLButtonElement>(`#translation-${kind}-language`);
+    const options = languageOptions(kind);
+    trigger.querySelector<HTMLElement>('.language-current')!.textContent = options.find(option => option.value === pickerValue(kind))?.label || options[0].label;
+    trigger.disabled = !selectionSettings;
+    requireElement<HTMLElement>(`#translation-${kind}-list`).innerHTML = options.map((option, index) =>
+      `<div role="option" id="translation-${kind}-option-${index}" data-language-kind="${kind}" data-language-value="${option.value}" aria-selected="${option.value === pickerValue(kind)}">${option.label}</div>`).join('');
+  }
+  syncLanguageMenu();
+}
+function selectLanguage(kind: LanguagePicker, value: string) {
+  if (!languageOptions(kind).some(option => option.value === value)) return;
+  const changed = languageChanged(pickerValue(kind), value);
+  if (kind === 'source') selectionSourceLanguage = value; else selectionTargetLanguage = value;
+  updateTranslationLanguages();
+  requireElement<HTMLButtonElement>(`#translation-${kind}-language`).focus();
+  if (changed && lastSource) void translateSelection(true);
 }
 function renderTranslation() {
   document.body.className = 'translation-body';
-  app.innerHTML = `<div class="translation-window"><header class="translation-header"><div class="translation-brand"><span class="translation-mark">${icons.spark}</span><strong>一划</strong><span class="translation-caption">选中即达</span></div><div class="translation-header-actions"><button class="icon-button" id="open-main" title="打开设置" aria-label="打开设置">${icons.settings}</button><button class="icon-button" id="close-translation" title="关闭" aria-label="关闭">${icons.close}</button></div></header><div class="translation-languages"><select id="translation-source-language" aria-label="原文语言" disabled></select><span aria-hidden="true">→</span><select id="translation-target-language" aria-label="目标语言" disabled></select></div><div class="translation-content"><div class="translation-label"><span>原文</span><span id="source-length"></span></div><p class="source-text" id="source-text">等待选中文字</p><div class="translation-divider"><span>${icons.translate}</span></div><div class="translation-label"><span>译文</span><span><span id="translation-provider"></span><span id="translation-progress"></span></span></div><div id="translation-result" class="translation-result" aria-live="polite">等待翻译</div><p id="translation-status" class="error small" role="status" hidden></p></div><footer class="translation-footer"><span>原文发送至所选服务商</span><div class="translation-actions"><button class="copy-action" id="retry-result" hidden>重试</button><button class="copy-action" id="copy-result" disabled>${icons.copy}<span>复制译文</span></button></div></footer></div><div id="toast" class="toast" role="status"></div>`;
+  app.innerHTML = `<div class="translation-window"><header class="translation-header"><div class="translation-brand"><span class="translation-mark">${icons.spark}</span><strong>一划</strong><span class="translation-caption">选中即达</span></div><div class="translation-header-actions"><button class="icon-button pin-button" id="pin-translation" title="固定浮窗" aria-label="固定译文浮窗" aria-pressed="false">${icons.pin}</button><button class="icon-button" id="open-main" title="打开设置" aria-label="打开设置">${icons.settings}</button><button class="icon-button" id="close-translation" title="关闭" aria-label="关闭">${icons.close}</button></div></header><div class="translation-languages"><div class="language-picker"><button class="language-trigger" id="translation-source-language" role="combobox" aria-label="原文语言" aria-haspopup="listbox" aria-controls="translation-source-list" aria-expanded="false" disabled><span class="language-current"></span><span class="language-chevron" aria-hidden="true">⌄</span></button><div class="language-menu" id="translation-source-list" role="listbox" aria-label="原文语言" hidden></div></div><span aria-hidden="true">→</span><div class="language-picker"><button class="language-trigger" id="translation-target-language" role="combobox" aria-label="目标语言" aria-haspopup="listbox" aria-controls="translation-target-list" aria-expanded="false" disabled><span class="language-current"></span><span class="language-chevron" aria-hidden="true">⌄</span></button><div class="language-menu" id="translation-target-list" role="listbox" aria-label="目标语言" hidden></div></div></div><div class="translation-content"><div class="translation-label"><span>原文</span><span id="source-length"></span></div><p class="source-text" id="source-text">等待选中文字</p><div class="translation-divider"><span>${icons.translate}</span></div><div class="translation-label"><span>译文</span><span><span id="translation-provider"></span><span id="translation-progress"></span></span></div><div id="translation-result" class="translation-result" aria-live="polite">等待翻译</div><p id="translation-status" class="error small" role="status" hidden></p></div><footer class="translation-footer"><span>原文发送至所选服务商</span><div class="translation-actions"><button class="copy-action" id="retry-result" hidden>重试</button><button class="copy-action" id="copy-result" disabled>${icons.copy}<span>复制译文</span></button></div></footer></div><div id="toast" class="toast" role="status"></div>`;
   updateTranslationLanguages();
-  const closeTranslation = () => { stopSelection(true); void call('dismiss_overlay').catch(error => notify(errorMessage(error), 'error')); };
+  const closeTranslation = () => { stopSelection(true); void call('dismiss_overlay', { generation: windowGeneration }).catch(error => notify(errorMessage(error), 'error')); };
   document.querySelector('#close-translation')?.addEventListener('click', closeTranslation);
+  requireElement<HTMLButtonElement>('#pin-translation').addEventListener('click', async event => {
+    const button = event.currentTarget as HTMLButtonElement;
+    button.disabled = true;
+    try {
+      selectionPinned = await call<boolean>('set_translation_pinned', { generation: windowGeneration, pinned: !selectionPinned });
+      button.setAttribute('aria-pressed', String(selectionPinned));
+      button.title = selectionPinned ? '取消固定' : '固定浮窗';
+    } catch (error) { notify(errorMessage(error), 'error'); }
+    finally { button.disabled = false; }
+  });
   document.querySelector('#open-main')?.addEventListener('click', () => { void call('show_main').catch(error => notify(errorMessage(error), 'error')); });
   document.querySelector('#copy-result')?.addEventListener('click', () => { void call('copy_text', { text: lastResult }).then(() => notify('译文已复制')).catch(error => notify(errorMessage(error), 'error')); });
   document.querySelector('#retry-result')?.addEventListener('click', () => { void translateSelection(true); });
-  document.querySelector('.translation-languages')?.addEventListener('change', event => {
-    const select = event.target as HTMLSelectElement;
-    if (select.id === 'translation-source-language') selectionSourceLanguage = select.value;
-    else if (select.id === 'translation-target-language') selectionTargetLanguage = select.value;
-    else return;
-    if (lastSource) void translateSelection(true);
+  const languages = requireElement<HTMLElement>('.translation-languages');
+  languages.addEventListener('pointerdown', event => { if ((event.target as Element).closest('[role=option]')) event.preventDefault(); });
+  languages.addEventListener('click', event => {
+    const element = event.target as Element;
+    const option = element.closest<HTMLElement>('[data-language-value]');
+    if (option) { selectLanguage(option.dataset.languageKind as LanguagePicker, option.dataset.languageValue!); return; }
+    const trigger = element.closest<HTMLButtonElement>('.language-trigger');
+    if (trigger && !trigger.disabled) {
+      const kind: LanguagePicker = trigger.id === 'translation-source-language' ? 'source' : 'target';
+      setLanguageMenu(toggleLanguageMenu(languageMenu, kind));
+    }
   });
-  document.addEventListener('keydown', event => { if (event.key === 'Escape' && !(event.target instanceof HTMLSelectElement)) closeTranslation(); });
+  languages.addEventListener('keydown', event => {
+    const trigger = (event.target as Element).closest<HTMLButtonElement>('.language-trigger');
+    if (!trigger) return;
+    const kind: LanguagePicker = trigger.id === 'translation-source-language' ? 'source' : 'target';
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault();
+      if (languageMenu !== kind) setLanguageMenu(kind);
+      else { activeLanguageIndex = moveLanguageOption(activeLanguageIndex, languageOptions(kind).length, event.key); syncLanguageMenu(); }
+    } else if ((event.key === 'Enter' || event.key === ' ') && languageMenu === kind) {
+      event.preventDefault(); selectLanguage(kind, languageOptions(kind)[activeLanguageIndex].value);
+    } else if (event.key === 'Tab' && languageMenu) setLanguageMenu(null);
+  });
+  app.addEventListener('pointerdown', event => { if (languageMenu && !(event.target as Element).closest('.language-picker')) setLanguageMenu(null); });
+  window.addEventListener('blur', () => { if (languageMenu) setLanguageMenu(null); });
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    const action = escapeLanguageMenu(languageMenu);
+    event.preventDefault();
+    if (action.closeWindow) closeTranslation(); else setLanguageMenu(action.menu);
+  });
 }
-async function translateSelection(retry = false) {
+async function translateSelection(retry = false, selectedText?: string) {
   stopSelection(); const generation = selectionGeneration; selectionRunning = true; lastResult = '';
   if (!retry) { lastSource = ''; selectionSettings = null; updateTranslationLanguages(); }
   const source = requireElement<HTMLParagraphElement>('#source-text');
@@ -424,7 +533,7 @@ async function translateSelection(retry = false) {
   copy.disabled = true; source.textContent = '正在获取选中文字…'; length.textContent = '';
   result.innerHTML = '<span class="loading-dots"><i></i><i></i><i></i></span> 正在翻译'; result.classList.remove('error');
   try {
-    const text = retry ? lastSource : await call<string>('get_pending_selection');
+    const text = retry ? lastSource : selectedText ?? await call<string>('get_pending_selection');
     if (generation !== selectionGeneration) return;
     if (!text.trim()) throw new Error('没有获取到选中文字，请重新选择。');
     lastSource = text;
@@ -474,14 +583,24 @@ async function bootstrap() {
   if (windowKind === 'translation') {
     renderTranslation();
     document.addEventListener('visibilitychange', () => { if (document.hidden) stopSelection(true); });
-    if (isTauri) { try { await listen<SelectionEvent>('selection', () => { void translateSelection(); }); await call('translation_ready'); } catch (error) { const result = requireElement<HTMLDivElement>('#translation-result'); result.textContent = `无法接收划词：${errorMessage(error)}`; result.classList.add('error'); } }
+    if (isTauri) void call<boolean>('translation_auto_close_available').then(available => { if (!available) notify('自动关闭暂不可用，可使用关闭按钮', 'error'); }).catch(() => {});
+    if (isTauri) { try { await listen<SelectionEvent>('selection', event => { const sequence = event.payload?.sequence; if (sequence !== undefined && sequence <= latestSelectionSequence) return; if (sequence !== undefined) latestSelectionSequence = sequence; void translateSelection(false, event.payload?.text); }); await call('translation_ready', { generation: windowGeneration }); } catch (error) { const result = requireElement<HTMLDivElement>('#translation-result'); result.textContent = `无法接收划词：${errorMessage(error)}`; result.classList.add('error'); } }
     else { requireElement<HTMLParagraphElement>('#source-text').textContent = 'A little curiosity goes a long way.'; requireElement<HTMLDivElement>('#translation-result').textContent = '一点好奇心，可以走很远。'; }
     return;
   }
+  let snapshot: MainSnapshot | null = null;
+  if (isTauri) {
+    try { snapshot = await call<MainSnapshot | null>('take_main_snapshot'); }
+    catch (error) { loadError = `无法恢复窗口状态：${errorMessage(error)}`; }
+  }
   try { settings = await call<Settings>('get_settings'); } catch (error) { loadError = `无法读取应用状态：${errorMessage(error)}`; }
-  renderMain(); app.addEventListener('click', event => { void handleMainClick(event); });
+  await restoreMain(snapshot); app.addEventListener('click', event => { void handleMainClick(event); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) { stopManual(); updateManualView(); } });
   app.addEventListener('input', event => { const target = event.target as HTMLInputElement; if (target.id === 'workspace-id') workspaceId = target.value; if (target.id === 'manual-text') manualDraft = target.value; });
+  if (isTauri) {
+    try { await listen<number>('prepare-main-close', event => { void closeMainWithDraft(event.payload); }); }
+    catch (error) { notify(`无法启用窗口关闭：${errorMessage(error)}`, 'error'); }
+  }
 }
 void bootstrap();
 

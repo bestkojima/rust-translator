@@ -18,9 +18,27 @@
 .translate-bubble:focus-visible{outline:0;background:#286b4a}
 @media(prefers-reduced-motion:reduce){.translate-bubble,.translate-bubble svg{transition:none}.translate-bubble:hover svg{transform:none}}
 .translation-languages{display:flex;align-items:center;gap:7px;flex:none;padding:9px 16px;border-bottom:1px solid #f0f2ee;color:#8ba18f;font-size:12px}
-.translation-languages select{min-width:88px;height:28px;padding:0 7px;border:1px solid #e3eae1;border-radius:7px;background:#f9fbf8;color:#355a41;font-size:12px;cursor:pointer}
-.translation-languages select:disabled{opacity:.6;cursor:default}
-.translation-languages select:focus-visible{outline:2px solid #95cbb0;outline-offset:1px}
+.language-picker{position:relative}
+.language-trigger{display:flex;align-items:center;justify-content:space-between;gap:9px;min-width:88px;height:28px;padding:0 8px;border:1px solid #e3eae1;border-radius:7px;background:#f9fbf8;color:#355a41;font:inherit;font-size:12px;cursor:pointer}
+.language-trigger:disabled{opacity:.6;cursor:default}
+.language-trigger:focus-visible{outline:2px solid #95cbb0;outline-offset:1px}
+.language-chevron{font-size:15px;line-height:1;transition:transform .15s ease}
+.language-trigger[aria-expanded="true"] .language-chevron{transform:rotate(180deg)}
+.language-menu{position:absolute;z-index:5;top:calc(100% + 5px);left:0;min-width:100%;padding:4px;border:1px solid #e1eadf;border-radius:8px;background:#fff;box-shadow:0 6px 18px #193d2b24;color:#355a41;white-space:nowrap}
+.language-menu[hidden]{display:none}
+.language-menu [role=option]{padding:7px 9px;border-radius:5px;cursor:pointer}
+.language-menu [role=option]:hover,.language-menu [data-active="true"]{background:#eff7ef;color:#245d43}
+.language-menu [aria-selected="true"]{font-weight:700}
+
+.pin-button{transition:background .2s ease,color .2s ease,box-shadow .2s ease}
+.pin-button svg{transform:rotate(-38deg);transition:transform .26s cubic-bezier(.2,1.5,.4,1)}
+.pin-button:hover{background:#e5f3e8;color:#328259}
+.pin-button:hover svg{transform:rotate(-12deg) scale(1.16)}
+.pin-button[aria-pressed="true"]{background:#dff1e4;color:#23784c;box-shadow:inset 0 0 0 1px #bee3c8}
+.pin-button[aria-pressed="true"] svg{transform:rotate(0deg)}
+.pin-button[aria-pressed="true"]:hover svg{transform:rotate(13deg) scale(1.14)}
+.pin-button:focus-visible{outline:2px solid #79b991;outline-offset:2px}
+@media(prefers-reduced-motion:reduce){.pin-button,.pin-button svg{transition:none}}
 
 /* Provider avatars keep the same round silhouette everywhere they appear. */
 .provider-icon{width:42px;height:42px;border-radius:50%;font-size:18px;font-weight:700;line-height:1;color:#fff}

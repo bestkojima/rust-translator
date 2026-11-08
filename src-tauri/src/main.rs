@@ -4,12 +4,13 @@ mod capture;
 mod streaming;
 
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, sync::{Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
+use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}}, time::Duration};
 use tauri::{Emitter, Manager, PhysicalPosition, Position, State, WebviewUrl, WebviewWindowBuilder};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
+use windows::Win32::{Foundation::HWND, UI::{Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent}, WindowsAndMessaging::{DispatchMessageW, GetAncestor, GetForegroundWindow, GetMessageW, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GA_ROOTOWNER, MSG, WINEVENT_OUTOFCONTEXT}}};
 
 const MODEL: &str = "tencent/Hunyuan-MT-7B";
 const ALIYUN_MODEL: &str = "deepseek-v4.1-flash";
@@ -59,8 +60,13 @@ struct AppState {
     pending: Mutex<String>,
     credential_lock: Mutex<()>,
     capture_error: Mutex<Option<String>>,
-    translation_ready: AtomicBool,
-    translation_pending: AtomicBool,
+    translation: Mutex<TranslationLifecycle>,
+    window_operations: tokio::sync::Mutex<()>,
+    main_snapshot: Mutex<Option<serde_json::Value>>,
+    main_closing: AtomicBool,
+    main_close_epoch: AtomicU64,
+    main_generation: AtomicU64,
+    foreground_hook_active: AtomicBool,
     client: reqwest::Client,
     aliyun_client: reqwest::Client,
     stream_client: reqwest::Client,
@@ -95,6 +101,40 @@ impl StreamRegistry {
 
 #[derive(Clone, Serialize)]
 struct TranslationChunk { request_id: String, delta: String }
+
+#[derive(Default)]
+struct TranslationLifecycle { generation: u64, sequence: u64, ready: bool, pending: Option<(u64, String)>, pinned: bool, activated: bool, focus_epoch: u64, native_handle: Option<usize> }
+impl TranslationLifecycle {
+    fn begin(&mut self) -> u64 { self.generation = self.generation.wrapping_add(1).max(1); self.ready = false; self.pending = None; self.pinned = false; self.activated = false; self.native_handle = None; self.focus_epoch = self.focus_epoch.wrapping_add(1); self.generation }
+    fn queue(&mut self, text: String) -> Option<(u64, String)> { self.focus_epoch = self.focus_epoch.wrapping_add(1); self.sequence = self.sequence.wrapping_add(1).max(1); let selection = (self.sequence, text); if self.ready { Some(selection) } else { self.pending = Some(selection); None } }
+    fn ready(&mut self, generation: u64) -> Option<(u64, String)> { if self.generation != generation { return None; } self.ready = true; self.pending.take() }
+    fn close(&mut self, generation: u64) -> bool { if self.generation != generation { return false; } self.ready = false; self.pending = None; self.native_handle = None; self.generation = self.generation.wrapping_add(1).max(1); true }
+    fn focus_changed(&mut self, focused: bool) -> Option<(u64, u64)> {
+        self.focus_epoch = self.focus_epoch.wrapping_add(1);
+        if focused { self.activated = true; None }
+        else if self.activated && !self.pinned { Some((self.generation, self.focus_epoch)) }
+        else { None }
+    }
+    fn set_pinned(&mut self, generation: u64, pinned: bool) -> Result<bool, String> {
+        if generation != self.generation { return Err("译文浮窗已关闭".into()); }
+        self.pinned = pinned;
+        self.focus_epoch = self.focus_epoch.wrapping_add(1);
+        Ok(self.pinned)
+    }
+    fn should_dismiss(&self, generation: u64, focus_epoch: u64) -> bool {
+        self.generation == generation && self.focus_epoch == focus_epoch && self.activated && !self.pinned
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct SelectionPayload { sequence: u64, text: String }
+
+fn cancel_window_streams(state: &AppState, label: &str) {
+    if let Ok(registry) = state.streams.lock() {
+        let prefix = format!("{label}:");
+        for (id, sender) in &registry.active { if id.starts_with(&prefix) { let _ = sender.send(true); } }
+    }
+}
 
 fn key_entry() -> Result<keyring_core::Entry, String> {
     key_entry_for("siliconflow")
@@ -318,10 +358,17 @@ fn cancel_translation(window: tauri::WebviewWindow, state: State<'_, AppState>, 
 }
 
 #[tauri::command]
-async fn translate_stream(window: tauri::WebviewWindow, state: State<'_, AppState>, text: String, request_id: String, source_language: Option<String>, target_language: Option<String>, expected_provider: Option<String>) -> Result<String, String> {
+async fn translate_stream(window: tauri::WebviewWindow, state: State<'_, AppState>, text: String, request_id: String, source_language: Option<String>, target_language: Option<String>, expected_provider: Option<String>, window_generation: Option<u64>) -> Result<String, String> {
     let registry_key = stream_key(&window, &request_id)?;
     let mut receiver = {
         let mut registry = state.streams.lock().map_err(|_| "启动翻译失败")?;
+        let current_generation = match window.label() {
+            "main" if state.main_closing.load(Ordering::SeqCst) => return Err("窗口正在关闭".into()),
+            "main" => Some(state.main_generation.load(Ordering::SeqCst)),
+            "translation" => Some(state.translation.lock().map_err(|_| "启动翻译失败")?.generation),
+            _ => None,
+        };
+        if !valid_stream_generation(window_generation, current_generation) { return Err("窗口已关闭".into()); }
         registry.register(registry_key.clone())?
     };
     let work = async {
@@ -358,6 +405,10 @@ async fn translate_stream(window: tauri::WebviewWindow, state: State<'_, AppStat
     };
     if let Ok(mut registry) = state.streams.lock() { registry.active.remove(&registry_key); }
     result
+}
+
+fn valid_stream_generation(requested: Option<u64>, current: Option<u64>) -> bool {
+    requested.is_none() || requested == current
 }
 
 fn validate_expected_provider(expected: Option<&str>, actual: &str) -> Result<(), String> {
@@ -743,39 +794,200 @@ fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     app.opener().open_url(url, None::<&str>).map_err(|e| format!("无法打开浏览器：{e}"))
 }
 
-#[tauri::command]
-fn show_main(app: tauri::AppHandle) -> Result<(), String> {
-    let window = app.get_webview_window("main").ok_or("主窗口不存在")?;
+// Tauri queues native destruction; do not reuse a label until it has left the manager.
+async fn wait_until_closed(app: &tauri::AppHandle, label: &str) -> Result<(), String> {
+    for _ in 0..150 {
+        if app.get_webview_window(label).is_none() { return Ok(()); }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err("窗口关闭超时，请重试".into())
+}
+
+async fn show_main_impl(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    // A close request first waits for the webview to hand its unsaved draft to Rust.
+    for _ in 0..160 {
+        if !state.main_closing.load(Ordering::SeqCst) { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if state.main_closing.load(Ordering::SeqCst) { return Err("主窗口正在关闭，请稍后重试".into()); }
+    let _guard = state.window_operations.lock().await;
+    let window = match app.get_webview_window("main") {
+        Some(window) => window,
+        None => WebviewWindowBuilder::new(app, "main", WebviewUrl::App(format!("index.html?generation={}", state.main_generation.load(Ordering::SeqCst)).into()))
+            .title("一划 · 划词翻译").inner_size(1060.0, 760.0).min_inner_size(800.0, 620.0).center().build()
+            .map_err(|e| format!("打开主窗口失败：{e}"))?,
+    };
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn dismiss_overlay(window: tauri::WebviewWindow) { if window.label() == "overlay" || window.label() == "translation" { let _ = window.hide(); } }
+async fn show_main(app: tauri::AppHandle) -> Result<(), String> { show_main_impl(&app).await }
 
 #[tauri::command]
-fn open_translation(app: tauri::AppHandle) -> Result<(), String> {
+fn take_main_snapshot(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<Option<serde_json::Value>, String> {
+    if window.label() != "main" { return Err("窗口无权读取主窗口草稿".into()); }
+    Ok(state.main_snapshot.lock().map_err(|_| "读取草稿失败")?.take())
+}
+
+#[tauri::command]
+async fn close_main(window: tauri::WebviewWindow, state: State<'_, AppState>, snapshot: serde_json::Value, close_id: u64) -> Result<(), String> {
+    if window.label() != "main" { return Err("窗口无权关闭主窗口".into()); }
+    let _guard = state.window_operations.lock().await;
+    if !state.main_closing.load(Ordering::SeqCst) || state.main_close_epoch.load(Ordering::SeqCst) != close_id { return Err("窗口关闭请求已取消，请重试".into()); }
+    *state.main_snapshot.lock().map_err(|_| "保存草稿失败")? = Some(snapshot);
+    cancel_window_streams(&state, "main");
+    if let Err(error) = window.destroy() { state.main_closing.store(false, Ordering::SeqCst); return Err(format!("关闭窗口失败：{error}")); }
+    state.main_generation.fetch_add(1, Ordering::SeqCst);
+    let result = wait_until_closed(window.app_handle(), "main").await;
+    state.main_closing.store(false, Ordering::SeqCst);
+    result
+}
+
+#[tauri::command]
+async fn dismiss_overlay(window: tauri::WebviewWindow, state: State<'_, AppState>, generation: Option<u64>) -> Result<(), String> {
+    if window.label() == "overlay" { return window.hide().map_err(|e| e.to_string()); }
+    if window.label() != "translation" { return Err("窗口无权关闭译文浮窗".into()); }
+    close_translation_window(window, &state, generation, None).await
+}
+
+// Focus within an owned native popup is not an outside interaction. A
+// temporarily unavailable foreground is inconclusive.
+fn foreground_is_outside(window: &tauri::WebviewWindow) -> bool {
+    let Ok(hwnd) = window.hwnd() else { return false; };
+    foreground_belongs_to(hwnd) == Some(false)
+}
+
+fn foreground_belongs_to(hwnd: HWND) -> Option<bool> {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.0.is_null() { return None; }
+        let foreground_root = GetAncestor(foreground, GA_ROOTOWNER);
+        let window_root = GetAncestor(hwnd, GA_ROOTOWNER);
+        if foreground_root.0.is_null() || window_root.0.is_null() { None } else { Some(foreground_root == window_root) }
+    }
+}
+
+async fn close_translation_window(window: tauri::WebviewWindow, state: &AppState, generation: Option<u64>, focus_epoch: Option<u64>) -> Result<(), String> {
+    let _guard = state.window_operations.lock().await;
+    let generation = {
+        let lifecycle = state.translation.lock().map_err(|_| "关闭译文浮窗失败")?;
+        let generation = generation.unwrap_or(lifecycle.generation);
+        if lifecycle.generation != generation { return Ok(()); }
+        if let Some(epoch) = focus_epoch {
+            if !lifecycle.should_dismiss(generation, epoch) || !foreground_is_outside(&window) { return Ok(()); }
+        }
+        generation
+    };
+    window.destroy().map_err(|e| format!("关闭译文浮窗失败：{e}"))?;
+    state.translation.lock().map_err(|_| "关闭译文浮窗失败")?.close(generation);
+    cancel_window_streams(&state, "translation");
+    wait_until_closed(window.app_handle(), "translation").await
+}
+
+#[tauri::command]
+async fn set_translation_pinned(window: tauri::WebviewWindow, state: State<'_, AppState>, generation: u64, pinned: bool) -> Result<bool, String> {
+    if window.label() != "translation" { return Err("窗口无权固定译文浮窗".into()); }
+    let _guard = state.window_operations.lock().await;
+    state.translation.lock().map_err(|_| "切换固定状态失败")?.set_pinned(generation, pinned)
+}
+
+fn schedule_focus_dismissal(handle: tauri::AppHandle, generation: u64, epoch: u64) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        if let Some(window) = handle.get_webview_window("translation") {
+            let _ = close_translation_window(window, &handle.state::<AppState>(), Some(generation), Some(epoch)).await;
+        }
+    });
+}
+
+// Tauri's focus state can already be false while WebView2 owns the keyboard,
+// so a later external activation may not produce another Focused(false) event.
+static FOREGROUND_APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+unsafe extern "system" fn foreground_event(_: HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32) {
+    let Some(handle) = FOREGROUND_APP.get() else { return; };
+    let token = {
+        let state = handle.state::<AppState>();
+        let Ok(mut lifecycle) = state.translation.lock() else { return; };
+        let Some(hwnd) = lifecycle.native_handle else { return; };
+        let Some(focused) = foreground_belongs_to(HWND(hwnd as *mut _)) else { return; };
+        lifecycle.focus_changed(focused)
+    };
+    if let Some((generation, epoch)) = token { schedule_focus_dismissal(handle.clone(), generation, epoch); }
+}
+
+fn start_foreground_monitor(handle: tauri::AppHandle) -> Result<(), String> {
+    FOREGROUND_APP.set(handle.clone()).map_err(|_| "前台窗口监听已启动")?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || unsafe {
+        let hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(foreground_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        if hook.0.is_null() { let _ = tx.send(false); return; }
+        handle.state::<AppState>().foreground_hook_active.store(true, Ordering::SeqCst);
+        let _ = tx.send(true);
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        let _ = UnhookWinEvent(hook);
+        handle.state::<AppState>().foreground_hook_active.store(false, Ordering::SeqCst);
+    });
+    match rx.recv_timeout(Duration::from_secs(2)) { Ok(true) => Ok(()), _ => Err("无法监听前台窗口，自动关闭可能不可用".into()) }
+}
+
+#[tauri::command]
+fn translation_auto_close_available(state: State<'_, AppState>) -> bool {
+    state.foreground_hook_active.load(Ordering::SeqCst)
+}
+
+#[tauri::command]
+async fn open_translation(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let _guard = state.window_operations.lock().await;
     let overlay = app.get_webview_window("overlay").ok_or("图标窗口不存在")?;
     let position = overlay.outer_position().map_err(|e| e.to_string())?;
-    let _ = overlay.hide();
-    let window = app.get_webview_window("translation").ok_or("翻译窗口不存在")?;
+    let text = state.pending.lock().map_err(|_| "读取选区失败")?.clone();
+    if text.trim().is_empty() { return Err("没有获取到选中文字，请重新选择。".into()); }
+    let existing = app.get_webview_window("translation");
+    let (generation, immediate) = {
+        let mut lifecycle = state.translation.lock().map_err(|_| "打开译文浮窗失败")?;
+        let generation = if existing.is_none() { lifecycle.begin() } else { lifecycle.generation };
+        (generation, lifecycle.queue(text))
+    };
+    let window = match existing {
+        Some(window) => window,
+        None => {
+            let route = format!("index.html?window=translation&generation={generation}");
+            match WebviewWindowBuilder::new(&app, "translation", WebviewUrl::App(route.into()))
+                .title("一划翻译").inner_size(420.0, 350.0).decorations(false).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).build() {
+                    Ok(window) => window,
+                    Err(error) => { if let Ok(mut lifecycle) = state.translation.lock() { lifecycle.close(generation); } return Err(format!("打开译文浮窗失败：{error}")); }
+                }
+        }
+    };
+    if let Ok(hwnd) = window.hwnd() {
+        let mut lifecycle = state.translation.lock().map_err(|_| "打开译文浮窗失败")?;
+        if lifecycle.generation == generation { lifecycle.native_handle = Some(hwnd.0 as usize); }
+    }
     let (x, y) = clamp_position(&window, (position.x, position.y), (position.x, position.y), (420, 350));
     window.set_position(Position::Physical(PhysicalPosition::new(x, y))).map_err(|e| e.to_string())?;
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())?;
-    let state = app.state::<AppState>();
-    state.translation_pending.store(true, Ordering::SeqCst);
-    if state.translation_ready.load(Ordering::SeqCst) && state.translation_pending.swap(false, Ordering::SeqCst) {
-        window.emit("selection", ()).map_err(|e| e.to_string())?;
-    }
+    let _ = overlay.hide();
+    if let Some((sequence, text)) = immediate { window.emit("selection", SelectionPayload { sequence, text }).map_err(|e| e.to_string())?; }
     Ok(())
 }
 
 #[tauri::command]
-fn translation_ready(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
+fn translation_ready(window: tauri::WebviewWindow, state: State<'_, AppState>, generation: Option<u64>) -> Result<(), String> {
     if window.label() != "translation" { return Err("窗口无权注册翻译事件".into()); }
-    state.translation_ready.store(true, Ordering::SeqCst);
-    if state.translation_pending.swap(false, Ordering::SeqCst) { window.emit("selection", ()).map_err(|e| e.to_string())?; }
+    let pending = {
+        let mut lifecycle = state.translation.lock().map_err(|_| "初始化译文浮窗失败")?;
+        let generation = generation.unwrap_or(lifecycle.generation);
+        lifecycle.ready(generation)
+    };
+    if let Some((sequence, text)) = pending { window.emit("selection", SelectionPayload { sequence, text }).map_err(|e| e.to_string())?; }
     Ok(())
 }
 
@@ -802,6 +1014,64 @@ fn clamp_to_work_area(target: (i32, i32), logical_size: (i32, i32), origin: (i32
     let height = (logical_size.1 as f64 * scale).ceil() as i32;
     (target.0.clamp(origin.0, (origin.0 + size.0 as i32 - width).max(origin.0)),
      target.1.clamp(origin.1, (origin.1 + size.1 as i32 - height).max(origin.1)))
+}
+
+#[cfg(test)]
+mod window_lifecycle_tests {
+    use super::{valid_stream_generation, StreamRegistry, TranslationLifecycle};
+
+    #[test]
+    fn latest_selection_waits_for_current_window_and_old_callbacks_are_ignored() {
+        let mut lifecycle = TranslationLifecycle::default();
+        let first = lifecycle.begin();
+        assert_eq!(lifecycle.queue("first".into()), None);
+        assert_eq!(lifecycle.queue("latest".into()), None);
+        assert_eq!(lifecycle.ready(first), Some((2, "latest".into())));
+        assert_eq!(lifecycle.queue("live".into()), Some((3, "live".into())));
+        assert!(lifecycle.close(first));
+        let second = lifecycle.begin();
+        assert_eq!(lifecycle.queue("next".into()), None);
+        assert_eq!(lifecycle.ready(first), None);
+        assert!(!lifecycle.close(first));
+        assert_eq!(lifecycle.ready(second), Some((4, "next".into())));
+        assert_eq!(lifecycle.ready(second), None);
+    }
+
+    #[test]
+    fn closed_generation_rejects_late_streams_and_active_streams_can_be_cancelled() {
+        assert!(valid_stream_generation(Some(3), Some(3)));
+        assert!(!valid_stream_generation(Some(3), Some(5)));
+        assert!(valid_stream_generation(None, Some(5))); // Older callers retain their contract.
+        let mut registry = StreamRegistry::default();
+        let mut receiver = registry.register("translation:req".into()).unwrap();
+        registry.cancel("translation:req".into());
+        assert_eq!(*receiver.borrow_and_update(), true);
+    }
+
+    #[test]
+    fn pin_and_focus_epoch_protect_the_current_window_from_stale_blur() {
+        let mut lifecycle = TranslationLifecycle::default();
+        let first = lifecycle.begin();
+        assert_eq!(lifecycle.focus_changed(false), None); // Initial setup has not focused yet.
+        assert_eq!(lifecycle.focus_changed(true), None);
+        let (_, pending_blur) = lifecycle.focus_changed(false).unwrap();
+        assert!(lifecycle.should_dismiss(first, pending_blur));
+        assert_eq!(lifecycle.set_pinned(first, true), Ok(true));
+        assert!(!lifecycle.should_dismiss(first, pending_blur));
+        assert_eq!(lifecycle.focus_changed(false), None);
+        assert_eq!(lifecycle.set_pinned(first, false), Ok(false));
+        let (_, another_blur) = lifecycle.focus_changed(false).unwrap();
+        lifecycle.focus_changed(true); // Focus returned while the timer was pending.
+        assert!(!lifecycle.should_dismiss(first, another_blur));
+        let (_, old_blur) = lifecycle.focus_changed(false).unwrap();
+        assert!(lifecycle.close(first));
+        let second = lifecycle.begin();
+        assert!(!lifecycle.pinned);
+        assert!(!lifecycle.should_dismiss(first, old_blur));
+        assert!(lifecycle.set_pinned(first, true).is_err());
+        assert_eq!(lifecycle.set_pinned(second, true), Ok(true));
+    }
+
 }
 
 #[cfg(test)]
@@ -843,7 +1113,8 @@ fn main() {
             });
             capture::set_enabled(settings.enabled);
             capture::set_excluded_apps(settings.excluded_apps.clone());
-            app.manage(AppState { settings: Mutex::new(settings), pending: Mutex::new(String::new()), credential_lock: Mutex::new(()), capture_error: Mutex::new(None), translation_ready: AtomicBool::new(false), translation_pending: AtomicBool::new(false), client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?, aliyun_client: aliyun_http_client()?, stream_client: stream_http_client()?, config_path, streams: Mutex::new(StreamRegistry::default()) });
+            app.manage(AppState { settings: Mutex::new(settings), pending: Mutex::new(String::new()), credential_lock: Mutex::new(()), capture_error: Mutex::new(None), translation: Mutex::new(TranslationLifecycle::default()), window_operations: tokio::sync::Mutex::new(()), main_snapshot: Mutex::new(None), main_closing: AtomicBool::new(false), main_close_epoch: AtomicU64::new(0), main_generation: AtomicU64::new(1), foreground_hook_active: AtomicBool::new(false), client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?, aliyun_client: aliyun_http_client()?, stream_client: stream_http_client()?, config_path, streams: Mutex::new(StreamRegistry::default()) });
+            if let Err(error) = start_foreground_monitor(app.handle().clone()) { eprintln!("{error}"); }
 
             let overlay = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("index.html?window=overlay".into()))
                 .title("一划").inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)
@@ -853,14 +1124,12 @@ fn main() {
             // The initial WM_GETMINMAXINFO arrives before tao installs its size constraints.
             // Resize once after creation so Windows' default minimum cannot enlarge the bubble.
             overlay.set_size(tauri::LogicalSize::new(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64))?;
-            WebviewWindowBuilder::new(app, "translation", WebviewUrl::App("index.html?window=translation".into()))
-                .title("一划翻译").inner_size(420.0, 350.0).decorations(false).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).build()?;
             let show = MenuItem::with_id(app, "show", "打开一划", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
             let mut tray = TrayIconBuilder::new().tooltip("一划 · 划词翻译").menu(&menu)
-                .on_menu_event(|app, event| match event.id.as_ref() { "show" => { let _ = show_main(app.clone()); }, "quit" => app.exit(0), _ => {} })
-                .on_tray_icon_event(|tray, event| { if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event { let _ = show_main(tray.app_handle().clone()); } });
+                .on_menu_event(|app, event| match event.id.as_ref() { "show" => { let handle = app.clone(); tauri::async_runtime::spawn(async move { if let Err(error) = show_main_impl(&handle).await { eprintln!("打开主窗口失败：{error}"); } }); }, "quit" => app.exit(0), _ => {} })
+                .on_tray_icon_event(|tray, event| { if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event { let handle = tray.app_handle().clone(); tauri::async_runtime::spawn(async move { if let Err(error) = show_main_impl(&handle).await { eprintln!("打开主窗口失败：{error}"); } }); } });
             if let Some(icon) = app.default_window_icon() { tray = tray.icon(icon.clone()); }
             tray.build(app)?;
             let handle = app.handle().clone();
@@ -880,8 +1149,49 @@ fn main() {
             }) { *app.state::<AppState>().capture_error.lock().unwrap() = Some(error); }
             Ok(())
         })
-        .on_window_event(|window, event| { if let tauri::WindowEvent::CloseRequested { api, .. } = event { api.prevent_close(); let _ = window.hide(); } })
-        .invoke_handler(tauri::generate_handler![get_settings, save_settings, save_model, fetch_models, set_api_key, clear_api_key, translate_text, translate_stream, cancel_translation, refresh_free_models, get_pending_selection, copy_text, open_url, show_main, dismiss_overlay, open_translation, translation_ready])
+        .on_window_event(|window, event| {
+            if window.label() == "translation" && !window.app_handle().state::<AppState>().foreground_hook_active.load(Ordering::SeqCst) {
+                if let tauri::WindowEvent::Focused(focused) = event {
+                    let handle = window.app_handle().clone();
+                    let token = window.hwnd().ok().and_then(|hwnd| {
+                        let state = handle.state::<AppState>();
+                        let mut lifecycle = state.translation.lock().ok()?;
+                        if lifecycle.native_handle != Some(hwnd.0 as usize) { return None; }
+                        lifecycle.focus_changed(*focused)
+                    });
+                    if let Some((generation, epoch)) = token {
+                        schedule_focus_dismissal(handle, generation, epoch);
+                    }
+                }
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            match window.label() {
+                "main" => {
+                    let state = window.app_handle().state::<AppState>();
+                    if !state.main_closing.swap(true, Ordering::SeqCst) {
+                        let close_id = state.main_close_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                        // The webview hands its unsaved fields to Rust before it is destroyed.
+                        let _ = window.emit("prepare-main-close", close_id);
+                        let handle = window.app_handle().clone();
+                        let window = window.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(3));
+                            let state = handle.state::<AppState>();
+                            // If the webview never registered its listener, hiding retains any draft.
+                            if state.main_close_epoch.load(Ordering::SeqCst) == close_id && state.main_closing.swap(false, Ordering::SeqCst) { let _ = window.hide(); }
+                        });
+                    }
+                },
+                "translation" => {
+                    let handle = window.app_handle().clone();
+                    let generation = handle.state::<AppState>().translation.lock().ok().map(|lifecycle| lifecycle.generation);
+                    if let Some(generation) = generation { tauri::async_runtime::spawn(async move { if let Some(window) = handle.get_webview_window("translation") { let _ = dismiss_overlay(window, handle.state::<AppState>(), Some(generation)).await; } }); }
+                },
+                _ => { let _ = window.hide(); },
+            }
+        } })
+        .invoke_handler(tauri::generate_handler![get_settings, save_settings, save_model, fetch_models, set_api_key, clear_api_key, translate_text, translate_stream, cancel_translation, refresh_free_models, get_pending_selection, copy_text, open_url, show_main, take_main_snapshot, close_main, dismiss_overlay, set_translation_pinned, translation_auto_close_available, open_translation, translation_ready])
         .run(tauri::generate_context!())
         .expect("启动一划失败");
 }

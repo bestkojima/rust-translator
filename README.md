@@ -1,14 +1,17 @@
-# 划词翻译
+# 一划 · Windows 划词翻译
 
 在 Windows 上选中一段文字，点击旁边的翻译图标，即可查看译文。遇到无法读取选区的应用，可以打开主窗口，粘贴文字进行手动翻译。
 
-## 开始使用
+## 安装与使用
+
+从仓库的 Releases 页面下载 Windows x64 发布文件。安装包按提示安装后启动；若下载的是独立程序，放到固定位置后运行 `wordglance.exe`（压缩包需先解压）。需要 Windows 10/11 和 Microsoft Edge WebView2 Runtime。
 
 1. 启动应用，打开侧边栏「模型接口」，从列表选择服务：阿里云百炼、硅基流动、DeepSeek、智谱 AI、Kimi、火山方舟、OpenRouter、OpenAI、Google Gemini、Anthropic Claude，或免密的 MyMemory。
 2. 在服务详情页切换当前服务；使用云端模型时，在服务商控制台创建 API Key 并在应用中保存。各服务的 Key 分开存入当前 Windows 用户的凭据管理器。
 3. 点击「获取模型列表」，输入模型名筛选，选择后点击「保存模型」；也可直接填写模型 ID。阿里云北京地域的列表接口还需要百炼工作空间 ID，翻译本身不需要这个 ID。智谱请手动填写模型 ID。
 4. 在浏览器或文档中选中文字，点击出现的图标。译文会显示在浮窗中，也可以复制；在浮窗中切换语言会重新翻译当前选区，不改变默认设置。
-5. 在「偏好设置」中选择原文与目标语言、暂停划词或排除程序；退出程序请使用系统托盘菜单。
+5. 译文浮窗默认在切换到其他窗口时关闭。点击图钉可固定，再次点击取消；关闭浮窗后下次打开默认不固定。浮窗内的语言选择只影响当前翻译。
+6. 在「偏好设置」中选择原文与目标语言、暂停划词或排除程序；退出程序请使用系统托盘菜单。
 
 使用支持流式输出的云端模型时，译文会随着服务商返回的内容逐段显示。MyMemory 接口返回完整结果后再显示；不同服务和模型的响应速度取决于其接口与网络。
 
@@ -36,11 +39,39 @@ npm install
 npm run tauri dev
 ```
 
-构建安装包：
+构建 Windows 安装包：
 
 ```powershell
 npm run tauri build
 ```
+
+默认构建产物位于 `src-tauri/target/release/`，NSIS 安装包位于其 `bundle/nsis/` 子目录。前端检查使用 `npm run build`；Rust 测试使用 `cargo test --manifest-path src-tauri/Cargo.toml`。使用支持直接运行 TypeScript 的 Node.js 版本时，语言菜单测试可通过 `node --test tests/language-menu.test.ts` 运行。
+
+## 项目结构
+
+```text
+rust-translator/
+├── src/
+│   ├── main.ts                # 前端界面、翻译流程与窗口交互
+│   ├── language-menu.ts       # 浮窗语言菜单状态与键盘操作
+│   ├── style.css              # 页面与浮窗样式
+│   └── assets/brands/         # 部分服务商图标
+├── src-tauri/
+│   ├── src/
+│   │   ├── main.rs            # Tauri 命令、窗口、配置和服务商接入
+│   │   ├── capture.rs         # Windows 跨应用划词捕获
+│   │   └── streaming.rs       # 流式响应处理
+│   ├── capabilities/          # Tauri 权限配置
+│   ├── icons/                 # 应用图标
+│   ├── Cargo.toml             # Rust 依赖
+│   └── tauri.conf.json        # 窗口和打包配置
+├── tests/                     # 语言菜单测试
+├── index.html                 # 前端入口
+├── package.json               # 前端依赖与命令
+└── THIRD_PARTY_NOTICES.md     # 第三方代码与许可声明
+```
+
+`dist/`、`node_modules/` 和 `src-tauri/target/` 是构建或依赖目录，不纳入版本管理。
 
 ## 隐私与兼容性
 
@@ -52,7 +83,7 @@ npm run tauri build
 
 ## 当前验证状态
 
-Rust 桌面应用和前端已完成编译；在 Codex 内置浏览器中双击英文后出现过划词图标。新版桌面程序已通过硅基流动获取真实模型列表，并验证手动翻译的实时增量输出及停止操作；划词图标到流式译文的完整链路、鼠标拖选及其他应用兼容性仍需验证。MyMemory 在此前测试的网络出口返回额度耗尽。其他云服务的真实账号调用尚未逐一验证。
+Windows 跨应用选词、图标和译文浮窗已有用户实机使用反馈。当前代码中的自动关闭、图钉、语言菜单以及按需释放窗口已通过构建和自动测试，仍待 Windows 实机联测；内存优化幅度也有待新版运行后测量。不同服务商、模型及目标应用的兼容性可能有所不同。
 
 ## 第三方代码
 

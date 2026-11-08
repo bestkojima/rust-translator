@@ -10,7 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{ "label": "main", "title": "一划 · 划词翻译", "width": 1060, "height": 760, "minWidth": 800, "minHeight": 620, "center": true }],
+    "windows": [{ "label": "main", "url": "index.html?generation=1", "title": "一划 · 划词翻译", "width": 1060, "height": 760, "minWidth": 800, "minHeight": 620, "center": true }],
     "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:" }
   },
   "bundle": { "active": true, "targets": "nsis", "icon": ["icons/icon.ico"] }
