@@ -1,3 +1,5 @@
+<img src="src-tauri/icons/icon.png" alt="一划应用图标" width="112" height="112">
+
 # 一划 · Wordglance
 
 **选中文字，点一下，译文就在眼前。**
