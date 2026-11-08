@@ -13,8 +13,6 @@ use tauri_plugin_opener::OpenerExt;
 use windows::Win32::{Foundation::HWND, UI::{Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent}, WindowsAndMessaging::{DispatchMessageW, GetAncestor, GetForegroundWindow, GetMessageW, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GA_ROOTOWNER, MSG, WINEVENT_OUTOFCONTEXT}}};
 
 const MODEL: &str = "tencent/Hunyuan-MT-7B";
-const ALIYUN_MODEL: &str = "deepseek-v4.1-flash";
-const ALIYUN_ENDPOINT: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 const SERVICE: &str = "com.wordglance.app";
 const OVERLAY_SIZE: i32 = 28;
 
@@ -140,23 +138,14 @@ fn key_entry() -> Result<keyring_core::Entry, String> {
     key_entry_for("siliconflow")
 }
 
-struct Provider { name: &'static str, chat: &'static str, models: &'static str, default_model: &'static str }
-fn provider(id: &str) -> Option<Provider> {
-    let (name, chat, models, default_model) = match id {
-        "siliconflow" => ("硅基流动", "https://api.siliconflow.cn/v1/chat/completions", "https://api.siliconflow.cn/v1/models?sub_type=chat", MODEL),
-        "aliyun" => ("阿里云百炼", ALIYUN_ENDPOINT, "", ALIYUN_MODEL),
-        "deepseek" => ("DeepSeek", "https://api.deepseek.com/chat/completions", "https://api.deepseek.com/models", "deepseek-chat"),
-        "openai" => ("OpenAI", "https://api.openai.com/v1/chat/completions", "https://api.openai.com/v1/models", "gpt-4o-mini"),
-        "openrouter" => ("OpenRouter", "https://openrouter.ai/api/v1/chat/completions", "https://openrouter.ai/api/v1/models", "openai/gpt-4o-mini"),
-        "moonshot" => ("Moonshot", "https://api.moonshot.cn/v1/chat/completions", "https://api.moonshot.cn/v1/models", "moonshot-v1-8k"),
-        "zhipu" => ("智谱", "https://open.bigmodel.cn/api/paas/v4/chat/completions", "", "glm-4-flash"),
-        "gemini" => ("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "https://generativelanguage.googleapis.com/v1beta/models", "gemini-2.5-flash"),
-        "anthropic" => ("Anthropic", "https://api.anthropic.com/v1/messages", "https://api.anthropic.com/v1/models", "claude-sonnet-4-5"),
-        "volcengine" => ("火山方舟", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "https://ark.cn-beijing.volces.com/api/v3/models", "doubao-seed-1-6-flash-250828"),
-        _ => return None,
-    };
-    Some(Provider { name, chat, models, default_model })
+#[derive(Deserialize)]
+struct Provider { name: String, chat: String, models: String, default_model: String }
+fn providers() -> &'static HashMap<String, Provider> {
+    static PROVIDERS: OnceLock<HashMap<String, Provider>> = OnceLock::new();
+    PROVIDERS.get_or_init(|| serde_json::from_str(include_str!("../providers.json"))
+        .expect("bundled provider configuration must be valid JSON"))
 }
+fn provider(id: &str) -> Option<&'static Provider> { providers().get(id) }
 fn selected_model(settings: &Settings, id: &str) -> String {
     settings.models_by_provider.as_ref().and_then(|m| m.get(id)).cloned().or_else(|| provider(id).map(|p| p.default_model.to_string())).unwrap_or_default()
 }
@@ -338,7 +327,7 @@ async fn translate_text(state: State<'_, AppState>, text: String) -> Result<Stri
     };
     let language = match settings.target_language.as_str() { "en" => "英文", "ja" => "日文", _ => "中文" };
     let model = selected_model(&settings, &settings.provider);
-    translate_provider_at(&state.aliyun_client, &settings.provider, spec.chat, &key, &model, submitted_text, language).await
+    translate_provider_at(&state.aliyun_client, &settings.provider, &spec.chat, &key, &model, submitted_text, language).await
 
 }
 
@@ -394,7 +383,7 @@ async fn translate_stream(window: tauri::WebviewWindow, state: State<'_, AppStat
         let model = selected_model(&settings, &settings.provider);
         let mut payload = translation_payload_with_source(&settings.provider, &model, submitted, language, source);
         payload["stream"] = true.into();
-        streaming::translate(&state.stream_client, &settings.provider, spec.chat, &key, &payload, |delta| {
+        streaming::translate(&state.stream_client, &settings.provider, &spec.chat, &key, &payload, |delta| {
             window.emit("translation-chunk", TranslationChunk { request_id: request_id.clone(), delta: delta.to_string() })
                 .map_err(|_| "无法显示流式译文".to_string())
         }).await
@@ -455,7 +444,7 @@ fn stream_http_client() -> Result<reqwest::Client, reqwest::Error> {
 
 #[cfg(test)]
 async fn translate_aliyun_at(client: &reqwest::Client, endpoint: &str, key: &str, text: &str, language: &str) -> Result<String, String> {
-    translate_provider_at(client, "aliyun", endpoint, key, ALIYUN_MODEL, text, language).await
+    translate_provider_at(client, "aliyun", endpoint, key, &provider("aliyun").unwrap().default_model, text, language).await
 }
 
 fn translation_payload(provider_id: &str, model: &str, text: &str, language: &str) -> serde_json::Value {
@@ -534,6 +523,22 @@ mod translation_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn bundled_provider_config_has_existing_services_and_safe_endpoints() {
+        let ids = ["siliconflow", "aliyun", "deepseek", "openai", "openrouter", "moonshot", "zhipu", "gemini", "anthropic", "volcengine"];
+        assert_eq!(providers().len(), ids.len());
+        for id in ids {
+            let spec = provider(id).expect("known provider must be configured");
+            assert!(!spec.name.is_empty());
+            assert!(spec.chat.starts_with("https://"));
+            assert!(spec.models.is_empty() || spec.models.starts_with("https://"));
+            assert!(!spec.default_model.is_empty());
+            assert_eq!(key_provider(Some(id)).unwrap(), id);
+        }
+        assert_eq!(provider("siliconflow").unwrap().default_model, MODEL);
+        assert!(provider("unknown").is_none());
+    }
 
     #[test]
     fn old_settings_keep_siliconflow() {
@@ -734,7 +739,7 @@ mod translation_tests {
         let request = task.join().unwrap();
         assert!(request.to_ascii_lowercase().contains("authorization: bearer dummy-test-key"));
         let json: serde_json::Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(json["model"], ALIYUN_MODEL);
+        assert_eq!(json["model"], provider("aliyun").unwrap().default_model);
         assert_eq!(json["enable_thinking"], false);
         assert_eq!(json["max_tokens"], 2048);
         assert_eq!(json["messages"][0]["role"], "user");
@@ -759,7 +764,8 @@ struct FreeModel { id: String, name: String }
 
 #[tauri::command]
 async fn refresh_free_models(state: State<'_, AppState>) -> Result<Vec<FreeModel>, String> {
-    let response = state.client.get("https://openrouter.ai/api/v1/models").send().await.map_err(|_| "无法连接 OpenRouter，请检查网络后重试")?;
+    let endpoint = &provider("openrouter").expect("bundled OpenRouter configuration").models;
+    let response = state.client.get(endpoint).send().await.map_err(|_| "无法连接 OpenRouter，请检查网络后重试")?;
     if !response.status().is_success() { return Err(format!("模型目录请求失败（HTTP {}）", response.status())); }
     let body: serde_json::Value = response.json().await.map_err(|_| "模型目录格式无法识别")?;
     let data = body.get("data").and_then(|v| v.as_array()).ok_or("模型目录格式无法识别")?;

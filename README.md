@@ -63,6 +63,7 @@ rust-translator/
 │   │   └── streaming.rs       # 流式响应处理
 │   ├── capabilities/          # Tauri 权限配置
 │   ├── icons/                 # 应用图标
+│   ├── providers.json         # 内置服务商接口和默认模型（不存密钥）
 │   ├── Cargo.toml             # Rust 依赖
 │   └── tauri.conf.json        # 窗口和打包配置
 ├── tests/                     # 语言菜单测试
@@ -72,6 +73,8 @@ rust-translator/
 ```
 
 `dist/`、`node_modules/` 和 `src-tauri/target/` 是构建或依赖目录，不纳入版本管理。
+
+需要 API Key 的模型服务商，其名称、翻译接口、模型列表接口和默认模型统一维护在 `src-tauri/providers.json`；该文件只放公开配置，不放 API Key。修改后重新构建应用才能生效。百炼模型列表地址需要工作空间 ID，仍由程序按固定的官方地域地址生成；智谱目前使用手动模型 ID；免密的 MyMemory 接口单独处理。新增服务商还需要实现相应的前端和协议处理，不能只添加一条 JSON 记录。
 
 ## 隐私与兼容性
 

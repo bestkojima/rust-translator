@@ -1,0 +1,12 @@
+{
+  "siliconflow": { "name": "硅基流动", "chat": "https://api.siliconflow.cn/v1/chat/completions", "models": "https://api.siliconflow.cn/v1/models?sub_type=chat", "default_model": "tencent/Hunyuan-MT-7B" },
+  "aliyun": { "name": "阿里云百炼", "chat": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "models": "", "default_model": "deepseek-v4.1-flash" },
+  "deepseek": { "name": "DeepSeek", "chat": "https://api.deepseek.com/chat/completions", "models": "https://api.deepseek.com/models", "default_model": "deepseek-chat" },
+  "openai": { "name": "OpenAI", "chat": "https://api.openai.com/v1/chat/completions", "models": "https://api.openai.com/v1/models", "default_model": "gpt-4o-mini" },
+  "openrouter": { "name": "OpenRouter", "chat": "https://openrouter.ai/api/v1/chat/completions", "models": "https://openrouter.ai/api/v1/models", "default_model": "openai/gpt-4o-mini" },
+  "moonshot": { "name": "Moonshot", "chat": "https://api.moonshot.cn/v1/chat/completions", "models": "https://api.moonshot.cn/v1/models", "default_model": "moonshot-v1-8k" },
+  "zhipu": { "name": "智谱", "chat": "https://open.bigmodel.cn/api/paas/v4/chat/completions", "models": "", "default_model": "glm-4-flash" },
+  "gemini": { "name": "Gemini", "chat": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "models": "https://generativelanguage.googleapis.com/v1beta/models", "default_model": "gemini-2.5-flash" },
+  "anthropic": { "name": "Anthropic", "chat": "https://api.anthropic.com/v1/messages", "models": "https://api.anthropic.com/v1/models", "default_model": "claude-sonnet-4-5" },
+  "volcengine": { "name": "火山方舟", "chat": "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "models": "https://ark.cn-beijing.volces.com/api/v3/models", "default_model": "doubao-seed-1-6-flash-250828" }
+}
