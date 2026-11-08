@@ -2,6 +2,7 @@ import './style.css';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { escapeLanguageMenu, languageChanged, moveLanguageOption, toggleLanguageMenu, type LanguageMenu } from './language-menu';
+import { createChunkBatcher } from './stream-batcher';
 
 type Provider = 'mymemory' | 'siliconflow' | 'aliyun' | 'deepseek' | 'openrouter' | 'openai' | 'zhipu' | 'moonshot' | 'gemini' | 'anthropic' | 'volcengine';
 type Settings = { enabled: boolean; excluded_apps: string[]; has_key: boolean; provider: Provider; model: string; view_model: string; source_language: string; target_language: string; capture_error?: string | null; credential_error?: string | null };
@@ -9,7 +10,7 @@ type FreeModel = { id: string; name: string };
 type SelectionEvent = { text?: string; sequence?: number };
 type MainSnapshot = { page: Page; detailProvider: Provider | null; manualDraft: string; manualResult: string; manualStatus: string; workspaceId: string; freeModels: FreeModel[]; modelsLoaded: boolean; availableModels: Partial<Record<Provider, FreeModel[]>>; fields: Record<string, { value: string; checked?: boolean }>; scrollY: number };
 type StreamChunk = { request_id: string; delta: string };
-type StreamRequest = { id: string; cancelled: boolean; started: boolean; unlisten?: () => void };
+type StreamRequest = { id: string; cancelled: boolean; started: boolean; unlisten?: () => void; finishChunks?: () => void };
 type TranslationLanguages = { sourceLanguage: string; targetLanguage: string; expectedProvider: Provider };
 type Page = 'translate' | 'providers' | 'discover' | 'settings';
 type AutostartStatus = 'disabled' | 'enabled' | 'stale' | 'blocked';
@@ -120,20 +121,24 @@ function newStreamRequest(): StreamRequest {
 }
 function cancelStream(request: StreamRequest | undefined) {
   if (!request || request.cancelled) return;
+  request.finishChunks?.(); request.finishChunks = undefined;
   request.cancelled = true;
   request.unlisten?.(); request.unlisten = undefined;
   if (request.started) void call('cancel_translation', { requestId: request.id }).catch(() => {});
 }
 async function runStream(text: string, request: StreamRequest, onChunk: (delta: string) => void, languages?: TranslationLanguages): Promise<string | undefined> {
   if (!isTauri) throw new Error('浏览器预览模式：请在桌面应用中使用此功能');
+  const chunks = createChunkBatcher(onChunk);
+  request.finishChunks = () => chunks.close();
   request.unlisten = await listen<StreamChunk>('translation-chunk', event => {
-    if (!request.cancelled && event.payload.request_id === request.id) onChunk(event.payload.delta);
+    if (!request.cancelled && event.payload.request_id === request.id) chunks.push(event.payload.delta);
   });
-  if (request.cancelled) { request.unlisten(); request.unlisten = undefined; return; }
+  if (request.cancelled) { chunks.close(); request.finishChunks = undefined; request.unlisten(); request.unlisten = undefined; return; }
   try {
     request.started = true;
     return await call<string>('translate_stream', { text, requestId: request.id, windowGeneration, ...languages });
   } finally {
+    chunks.close(); request.finishChunks = undefined;
     request.unlisten?.(); request.unlisten = undefined;
   }
 }
@@ -180,8 +185,8 @@ async function restoreMain(snapshot: MainSnapshot | null) {
   window.scrollTo(0, snapshot.scrollY || 0);
 }
 function stopSelection(showStatus = false) {
-  selectionGeneration++;
   cancelStream(selectionRequest); selectionRequest = undefined;
+  selectionGeneration++;
   if (showStatus && selectionRunning) {
     const result = document.querySelector<HTMLDivElement>('#translation-result');
     const status = document.querySelector<HTMLParagraphElement>('#translation-status');
@@ -626,7 +631,11 @@ async function translateSelection(retry = false, selectedText?: string) {
   }
 }
 async function bootstrap() {
-  if (windowKind === 'overlay') { renderOverlay(); return; }
+  if (windowKind === 'overlay') {
+    renderOverlay();
+    if (isTauri) void call('overlay_ready', { generation: windowGeneration }).catch(error => notify(errorMessage(error), 'error'));
+    return;
+  }
   if (windowKind === 'translation') {
     renderTranslation();
     document.addEventListener('visibilitychange', () => { if (document.hidden) stopSelection(true); });

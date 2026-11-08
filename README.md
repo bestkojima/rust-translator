@@ -71,7 +71,21 @@ npm run tauri dev
 npm run tauri build
 ```
 
-默认构建产物位于 `src-tauri/target/release/`，NSIS 安装包位于其 `bundle/nsis/` 子目录。前端检查使用 `npm run build`；Rust 测试使用 `cargo test --manifest-path src-tauri/Cargo.toml`。使用支持直接运行 TypeScript 的 Node.js 版本时，语言菜单测试可通过 `node --test tests/language-menu.test.ts` 运行。
+默认构建产物位于 `src-tauri/target/release/`，NSIS 安装包位于其 `bundle/nsis/` 子目录。前端检查使用 `npm run build`；Rust 测试使用 `cargo test --manifest-path src-tauri/Cargo.toml`。使用支持直接运行 TypeScript 的 Node.js 版本时，前端状态与流式合批测试通过 `npm test` 运行。
+
+## 后台占用与响应速度
+
+划词图标按需创建，隐藏后保留 30 秒，连续使用时复用；闲置后销毁。开机静默启动不预先创建图标网页，主窗口和译文浮窗关闭后也会释放。久置后第一次划词需要重新加载图标，换取更低的长期后台占用；图标尺寸、底色和 hover 保持原样。
+
+流式译文首块立即显示，后续增量按 32 毫秒合批更新界面，停止和完成时立即提交尾块。合批减少 DOM 更新，后续文字增加少量本地显示延迟；接口、模型、原文和最终译文不变。
+
+测量正在运行的一划及其 WebView2 子进程：
+
+```powershell
+.\scripts\measure-resources.ps1 -SampleSeconds 10
+```
+
+对比时使用相同窗口状态：从托盘退出旧版、启动新版，关闭主窗口和译文窗，等待图标隐藏超过 30 秒后采样，再检查首次划词与连续划词的响应。测量脚本只读取进程统计，不操作界面。Skill 筛选、优化取舍和优化前基线见 [性能记录](docs/performance-skills.md)；新版占用尚待实机复测。
 
 ## 项目结构
 
@@ -80,6 +94,7 @@ rust-translator/
 ├── src/
 │   ├── main.ts                # 前端界面、翻译流程与窗口交互
 │   ├── language-menu.ts       # 浮窗语言菜单状态与键盘操作
+│   ├── stream-batcher.ts      # 首块即时、后续流式合批
 │   ├── style.css              # 页面与浮窗样式
 │   └── assets/brands/         # 部分服务商图标
 ├── src-tauri/
@@ -87,6 +102,7 @@ rust-translator/
 │   │   ├── main.rs            # Tauri 命令、窗口、配置和服务商接入
 │   │   ├── autostart.rs       # 当前用户 Windows 启动项
 │   │   ├── capture.rs         # Windows 跨应用划词捕获
+│   │   ├── overlay_lifecycle.rs # 图标就绪、隐藏与闲置回收状态
 │   │   └── streaming.rs       # 流式响应处理
 │   ├── capabilities/          # Tauri 权限配置
 │   ├── windows/               # Windows 安装与卸载钩子
@@ -94,7 +110,9 @@ rust-translator/
 │   ├── providers.json         # 内置服务商接口和默认模型（不存密钥）
 │   ├── Cargo.toml             # Rust 依赖
 │   └── tauri.conf.json        # 窗口和打包配置
-├── tests/                     # 语言菜单测试
+├── docs/                      # Skill 调研、取舍与占用基线
+├── scripts/                   # 只读进程资源采样
+├── tests/                     # 语言菜单与流式合批测试
 ├── index.html                 # 前端入口
 ├── package.json               # 前端依赖与命令
 └── THIRD_PARTY_NOTICES.md     # 第三方代码与许可声明

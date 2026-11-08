@@ -2,6 +2,7 @@
 
 mod autostart;
 mod capture;
+mod overlay_lifecycle;
 mod streaming;
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use windows::Win32::{Foundation::HWND, UI::{Accessibility::{HWINEVENTHOOK, SetWi
 const MODEL: &str = "tencent/Hunyuan-MT-7B";
 const SERVICE: &str = "com.wordglance.app";
 const OVERLAY_SIZE: i32 = 28;
+const OVERLAY_IDLE_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
@@ -60,6 +62,9 @@ struct AppState {
     credential_lock: Mutex<()>,
     capture_error: Mutex<Option<String>>,
     translation: Mutex<TranslationLifecycle>,
+    overlay: Mutex<overlay_lifecycle::OverlayLifecycle>,
+    overlay_capture_epoch: AtomicU64,
+    overlay_reclaim: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     window_operations: tokio::sync::Mutex<()>,
     main_snapshot: Mutex<Option<serde_json::Value>>,
     main_closing: AtomicBool,
@@ -185,19 +190,26 @@ fn get_settings(state: State<'_, AppState>, provider: Option<String>) -> Result<
 }
 
 #[tauri::command]
-fn save_settings(app: tauri::AppHandle, state: State<'_, AppState>, mut settings: Settings) -> Result<(), String> {
+async fn save_settings(app: tauri::AppHandle, state: State<'_, AppState>, mut settings: Settings) -> Result<(), String> {
     if !["zh", "en", "ja"].contains(&settings.target_language.as_str()) { return Err("不支持该目标语言".into()); }
     if !["zh", "en", "ja"].contains(&settings.source_language.as_str()) { return Err("不支持该源语言".into()); }
     if settings.provider != "mymemory" && provider(&settings.provider).is_none() { return Err("不支持该翻译服务".into()); }
-    let mut current = state.settings.lock().map_err(|_| "保存设置失败")?;
-    if settings.models_by_provider.is_none() { settings.models_by_provider = current.models_by_provider.clone(); }
-    if let Some(dir) = state.config_path.parent() { fs::create_dir_all(dir).map_err(|e| format!("创建设置目录失败：{e}"))?; }
-    let data = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
-    fs::write(&state.config_path, data).map_err(|e| format!("保存设置失败：{e}"))?;
-    capture::set_enabled(settings.enabled);
-    capture::set_excluded_apps(settings.excluded_apps.clone());
-    if !settings.enabled { if let Some(window) = app.get_webview_window("overlay") { let _ = window.hide(); } }
-    *current = settings;
+    let enabled = settings.enabled;
+    {
+        let mut current = state.settings.lock().map_err(|_| "保存设置失败")?;
+        if settings.models_by_provider.is_none() { settings.models_by_provider = current.models_by_provider.clone(); }
+        if let Some(dir) = state.config_path.parent() { fs::create_dir_all(dir).map_err(|e| format!("创建设置目录失败：{e}"))?; }
+        let data = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
+        fs::write(&state.config_path, data).map_err(|e| format!("保存设置失败：{e}"))?;
+        capture::set_enabled(settings.enabled);
+        capture::set_excluded_apps(settings.excluded_apps.clone());
+        *current = settings;
+    }
+    if !enabled {
+        state.overlay_capture_epoch.fetch_add(1, Ordering::SeqCst);
+        let _guard = state.window_operations.lock().await;
+        if let Err(error) = hide_overlay_locked(&app, &state) { eprintln!("{error}"); }
+    }
     Ok(())
 }
 
@@ -810,6 +822,95 @@ async fn wait_until_closed(app: &tauri::AppHandle, label: &str) -> Result<(), St
     Err("窗口关闭超时，请重试".into())
 }
 
+fn cancel_overlay_reclaim(state: &AppState) {
+    if let Ok(mut reclaim) = state.overlay_reclaim.lock() {
+        if let Some(task) = reclaim.take() { task.abort(); }
+    }
+}
+
+// Call only with window_operations held. Hidden icons stay warm briefly, then
+// release the final WebView instead of keeping a renderer alive in the tray.
+fn hide_overlay_locked(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("overlay") else { return Ok(()); };
+    window.hide().map_err(|e| e.to_string())?;
+    let token = state.overlay.lock().map_err(|_| "关闭划词图标失败")?.hide();
+    if let Some(token) = token { schedule_overlay_reclaim(app, state, token)?; }
+    Ok(())
+}
+
+fn schedule_overlay_reclaim(app: &tauri::AppHandle, state: &AppState, (generation, epoch): (u64, u64)) -> Result<(), String> {
+    cancel_overlay_reclaim(state);
+    let handle = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(OVERLAY_IDLE_GRACE).await;
+        let state = handle.state::<AppState>();
+        let _guard = state.window_operations.lock().await;
+        if !state.overlay.lock().map(|icon| icon.reclaimable(generation, epoch)).unwrap_or(false) { return; }
+        if let Some(window) = handle.get_webview_window("overlay") {
+            if let Err(error) = window.destroy() { eprintln!("释放划词图标失败：{error}"); return; }
+            if let Ok(mut icon) = state.overlay.lock() { icon.closed(); }
+            if let Ok(mut pending) = state.pending.lock() { *pending = String::new(); }
+            if let Err(error) = wait_until_closed(&handle, "overlay").await { eprintln!("{error}"); }
+        }
+    });
+    *state.overlay_reclaim.lock().map_err(|_| "回收划词图标失败")? = Some(task);
+    Ok(())
+}
+
+async fn apply_capture_event(app: &tauri::AppHandle, capture_epoch: u64, event: capture::CaptureEvent) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let _guard = state.window_operations.lock().await;
+    if state.overlay_capture_epoch.load(Ordering::SeqCst) != capture_epoch { return Ok(()); }
+    match event {
+        capture::CaptureEvent::Dismiss => hide_overlay_locked(app, &state),
+        capture::CaptureEvent::Selection(selection) => {
+            if !state.settings.lock().map_err(|_| "读取划词设置失败")?.enabled { return Ok(()); }
+            cancel_overlay_reclaim(&state);
+            let window = match app.get_webview_window("overlay") {
+                Some(window) => window,
+                None => {
+                    let generation = {
+                        let mut icon = state.overlay.lock().map_err(|_| "创建划词图标失败")?;
+                        let generation = icon.begin();
+                        icon.request_show(capture_epoch);
+                        generation
+                    };
+                    let route = format!("index.html?window=overlay&generation={generation}");
+                    let window = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App(route.into()))
+                        .title("一划").inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)
+                        .min_inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)
+                        .max_inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)
+                        .decorations(false).shadow(false).transparent(true).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).focused(false).build()
+                        .map_err(|e| format!("创建划词图标失败：{e}"))?;
+                    // tao installs size constraints after the first WM_GETMINMAXINFO.
+                    // Keep the native bounds equal to the existing 28px round icon.
+                    window.set_size(tauri::LogicalSize::new(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)).map_err(|e| e.to_string())?;
+                    window
+                }
+            };
+            *state.pending.lock().map_err(|_| "保存选区失败")? = selection.text;
+            let (x, y) = clamp_position(&window, (selection.x, selection.y), (selection.x + 12, selection.y + 12), (OVERLAY_SIZE, OVERLAY_SIZE));
+            window.set_position(Position::Physical(PhysicalPosition::new(x, y))).map_err(|e| e.to_string())?;
+            let ready = state.overlay.lock().map_err(|_| "显示划词图标失败")?.request_show(capture_epoch);
+            if ready && state.overlay_capture_epoch.load(Ordering::SeqCst) == capture_epoch { window.show().map_err(|e| e.to_string())?; }
+            if !ready {
+                let token = state.overlay.lock().map_err(|_| "回收划词图标失败")?.loading_token();
+                if let Some(token) = token { schedule_overlay_reclaim(app, &state, token)?; }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[tauri::command]
+async fn overlay_ready(window: tauri::WebviewWindow, state: State<'_, AppState>, generation: u64) -> Result<(), String> {
+    if window.label() != "overlay" { return Err("窗口无权初始化划词图标".into()); }
+    let _guard = state.window_operations.lock().await;
+    let show = state.overlay.lock().map_err(|_| "初始化划词图标失败")?.loaded(generation, state.overlay_capture_epoch.load(Ordering::SeqCst));
+    if show { cancel_overlay_reclaim(&state); window.show().map_err(|e| e.to_string())?; }
+    Ok(())
+}
+
 async fn show_main_impl(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     // A close request first waits for the webview to hand its unsaved draft to Rust.
@@ -937,7 +1038,11 @@ async fn close_main(window: tauri::WebviewWindow, state: State<'_, AppState>, sn
 
 #[tauri::command]
 async fn dismiss_overlay(window: tauri::WebviewWindow, state: State<'_, AppState>, generation: Option<u64>) -> Result<(), String> {
-    if window.label() == "overlay" { return window.hide().map_err(|e| e.to_string()); }
+    if window.label() == "overlay" {
+        state.overlay_capture_epoch.fetch_add(1, Ordering::SeqCst);
+        let _guard = state.window_operations.lock().await;
+        return hide_overlay_locked(window.app_handle(), &state);
+    }
     if window.label() != "translation" { return Err("窗口无权关闭译文浮窗".into()); }
     close_translation_window(window, &state, generation, None).await
 }
@@ -1064,7 +1169,7 @@ async fn open_translation(app: tauri::AppHandle) -> Result<(), String> {
     window.set_position(Position::Physical(PhysicalPosition::new(x, y))).map_err(|e| e.to_string())?;
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())?;
-    let _ = overlay.hide();
+    if let Err(error) = hide_overlay_locked(&app, &state) { eprintln!("{error}"); }
     if let Some((sequence, text)) = immediate { window.emit("selection", SelectionPayload { sequence, text }).map_err(|e| e.to_string())?; }
     Ok(())
 }
@@ -1247,17 +1352,9 @@ fn main() {
             });
             capture::set_enabled(settings.enabled);
             capture::set_excluded_apps(settings.excluded_apps.clone());
-            app.manage(AppState { settings: Mutex::new(settings), pending: Mutex::new(String::new()), credential_lock: Mutex::new(()), capture_error: Mutex::new(None), translation: Mutex::new(TranslationLifecycle::default()), window_operations: tokio::sync::Mutex::new(()), main_snapshot: Mutex::new(None), main_closing: AtomicBool::new(false), main_close_epoch: AtomicU64::new(0), main_generation: AtomicU64::new(1), foreground_hook_active: AtomicBool::new(false), client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?, aliyun_client: aliyun_http_client()?, stream_client: stream_http_client()?, config_path, streams: Mutex::new(StreamRegistry::default()) });
+            app.manage(AppState { settings: Mutex::new(settings), pending: Mutex::new(String::new()), credential_lock: Mutex::new(()), capture_error: Mutex::new(None), translation: Mutex::new(TranslationLifecycle::default()), overlay: Mutex::new(overlay_lifecycle::OverlayLifecycle::default()), overlay_capture_epoch: AtomicU64::new(0), overlay_reclaim: Mutex::new(None), window_operations: tokio::sync::Mutex::new(()), main_snapshot: Mutex::new(None), main_closing: AtomicBool::new(false), main_close_epoch: AtomicU64::new(0), main_generation: AtomicU64::new(1), foreground_hook_active: AtomicBool::new(false), client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?, aliyun_client: aliyun_http_client()?, stream_client: stream_http_client()?, config_path, streams: Mutex::new(StreamRegistry::default()) });
             if let Err(error) = start_foreground_monitor(app.handle().clone()) { eprintln!("{error}"); }
 
-            let overlay = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("index.html?window=overlay".into()))
-                .title("一划").inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)
-                .min_inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)
-                .max_inner_size(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64)
-                .decorations(false).shadow(false).transparent(true).always_on_top(true).skip_taskbar(true).resizable(false).visible(false).focused(false).build()?;
-            // The initial WM_GETMINMAXINFO arrives before tao installs its size constraints.
-            // Resize once after creation so Windows' default minimum cannot enlarge the bubble.
-            overlay.set_size(tauri::LogicalSize::new(OVERLAY_SIZE as f64, OVERLAY_SIZE as f64))?;
             let show = MenuItem::with_id(app, "show", "打开一划", true, None::<&str>)?;
             let status = autostart::status().ok();
             let (label, checked) = autostart_menu_presentation(status.as_ref());
@@ -1288,20 +1385,27 @@ fn main() {
                 });
             if let Some(icon) = app.default_window_icon() { tray = tray.icon(icon.clone()); }
             tray.build(app)?;
+            // A latest-wins mailbox keeps slow WebView creation off the UIA worker
+            // and avoids replaying old selection/dismiss events after a cold start.
+            let (capture_tx, mut capture_rx) = tokio::sync::watch::channel(None::<(u64, capture::CaptureEvent)>);
             let handle = app.handle().clone();
-            if let Err(error) = capture::start(move |event| {
-                match event {
-                    capture::CaptureEvent::Selection(selection) => {
-                        let state = handle.state::<AppState>();
-                        if let Ok(mut pending) = state.pending.lock() { *pending = selection.text; }
-                        if let Some(window) = handle.get_webview_window("overlay") {
-                            let (x, y) = clamp_position(&window, (selection.x, selection.y), (selection.x + 12, selection.y + 12), (OVERLAY_SIZE, OVERLAY_SIZE));
-                            let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
-                            let _ = window.show();
+            tauri::async_runtime::spawn(async move {
+                while capture_rx.changed().await.is_ok() {
+                    let event = capture_rx.borrow_and_update().clone();
+                    if let Some((epoch, event)) = event {
+                        if let Err(error) = apply_capture_event(&handle, epoch, event).await {
+                            eprintln!("{error}");
+                            let state = handle.state::<AppState>();
+                            let _guard = state.window_operations.lock().await;
+                            let _ = hide_overlay_locked(&handle, &state);
                         }
                     }
-                    capture::CaptureEvent::Dismiss => { if let Some(window) = handle.get_webview_window("overlay") { let _ = window.hide(); } }
                 }
+            });
+            let handle = app.handle().clone();
+            if let Err(error) = capture::start(move |event| {
+                let epoch = handle.state::<AppState>().overlay_capture_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                capture_tx.send_replace(Some((epoch, event)));
             }) { *app.state::<AppState>().capture_error.lock().unwrap() = Some(error); }
             startup_ready_tx.send_replace(true);
             Ok(())
@@ -1345,10 +1449,19 @@ fn main() {
                     let generation = handle.state::<AppState>().translation.lock().ok().map(|lifecycle| lifecycle.generation);
                     if let Some(generation) = generation { tauri::async_runtime::spawn(async move { if let Some(window) = handle.get_webview_window("translation") { let _ = dismiss_overlay(window, handle.state::<AppState>(), Some(generation)).await; } }); }
                 },
+                "overlay" => {
+                    let handle = window.app_handle().clone();
+                    handle.state::<AppState>().overlay_capture_epoch.fetch_add(1, Ordering::SeqCst);
+                    tauri::async_runtime::spawn(async move {
+                        let state = handle.state::<AppState>();
+                        let _guard = state.window_operations.lock().await;
+                        let _ = hide_overlay_locked(&handle, &state);
+                    });
+                },
                 _ => { let _ = window.hide(); },
             }
         } })
-        .invoke_handler(tauri::generate_handler![get_autostart_status, set_autostart_enabled, get_settings, save_settings, save_model, fetch_models, set_api_key, clear_api_key, translate_text, translate_stream, cancel_translation, refresh_free_models, get_pending_selection, copy_text, open_url, show_main, take_main_snapshot, close_main, dismiss_overlay, set_translation_pinned, translation_auto_close_available, open_translation, translation_ready])
+        .invoke_handler(tauri::generate_handler![overlay_ready, get_autostart_status, set_autostart_enabled, get_settings, save_settings, save_model, fetch_models, set_api_key, clear_api_key, translate_text, translate_stream, cancel_translation, refresh_free_models, get_pending_selection, copy_text, open_url, show_main, take_main_snapshot, close_main, dismiss_overlay, set_translation_pinned, translation_auto_close_available, open_translation, translation_ready])
         .run(context)
         .expect("启动一划失败");
 }

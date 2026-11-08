@@ -1,0 +1,92 @@
+{
+  "RootProcessId": 46052,
+  "RootCreatedAtUtc": "2026-11-08T13:06:21.726285Z",
+  "StartedAtUtc": "2026-11-08T13:44:45.0149464+00:00",
+  "EndedAtUtc": "2026-11-08T13:44:55.1435101+00:00",
+  "RequestedSampleSeconds": 10.0,
+  "ActualSampleSeconds": 10.127941,
+  "SampleCount": 10,
+  "LogicalProcessorCount": 16,
+  "ProcessCount": 8,
+  "WebView2ProcessCount": 7,
+  "ObservedProcessCount": 8,
+  "WorkingSetMiB": 249.031,
+  "PrivateBytesMiB": 195.965,
+  "CpuTimeSeconds": 0.0,
+  "CpuPercentMachine": 0.0,
+  "Scope": "One wordglance.exe plus msedgewebview2.exe reached through its live parent-child tree; PID and creation time identify each process.",
+  "MemoryMeasurement": "End-of-sample snapshot. Working sets include shared pages, so summing can count shared pages more than once. PrivateBytes is private committed memory, not resident RAM.",
+  "CpuMeasurement": "Observed CPU deltas at approximately 1-second intervals; CPU percent is normalized across all logical processors. Exited processes can lose their final interval; processes born and exited between polls are not observed.",
+  "Processes": [
+    {
+      "ProcessId": 428,
+      "ParentProcessId": 3372,
+      "Name": "msedgewebview2.exe",
+      "CreatedAtUtc": "2026-11-08T13:06:21.914188Z",
+      "WorkingSetMiB": 18.301,
+      "PrivateBytesMiB": 7.285
+    },
+    {
+      "ProcessId": 3372,
+      "ParentProcessId": 46052,
+      "Name": "msedgewebview2.exe",
+      "CreatedAtUtc": "2026-11-08T13:06:21.790815Z",
+      "WorkingSetMiB": 66.453,
+      "PrivateBytesMiB": 34.023
+    },
+    {
+      "ProcessId": 6708,
+      "ParentProcessId": 3372,
+      "Name": "msedgewebview2.exe",
+      "CreatedAtUtc": "2026-11-08T13:06:21.895116Z",
+      "WorkingSetMiB": 26.988,
+      "PrivateBytesMiB": 10.742
+    },
+    {
+      "ProcessId": 7996,
+      "ParentProcessId": 3372,
+      "Name": "msedgewebview2.exe",
+      "CreatedAtUtc": "2026-11-08T13:06:22.044197Z",
+      "WorkingSetMiB": 20.359,
+      "PrivateBytesMiB": 20.887
+    },
+    {
+      "ProcessId": 14420,
+      "ParentProcessId": 3372,
+      "Name": "msedgewebview2.exe",
+      "CreatedAtUtc": "2026-11-08T13:06:21.894867Z",
+      "WorkingSetMiB": 35.184,
+      "PrivateBytesMiB": 77.148
+    },
+    {
+      "ProcessId": 27716,
+      "ParentProcessId": 3372,
+      "Name": "msedgewebview2.exe",
+      "CreatedAtUtc": "2026-11-08T13:06:21.955637Z",
+      "WorkingSetMiB": 34.285,
+      "PrivateBytesMiB": 35.523
+    },
+    {
+      "ProcessId": 33824,
+      "ParentProcessId": 3372,
+      "Name": "msedgewebview2.exe",
+      "CreatedAtUtc": "2026-11-08T13:06:21.814613Z",
+      "WorkingSetMiB": 11.656,
+      "PrivateBytesMiB": 2.973
+    },
+    {
+      "ProcessId": 46052,
+      "ParentProcessId": 37184,
+      "Name": "wordglance.exe",
+      "CreatedAtUtc": "2026-11-08T13:06:21.726285Z",
+      "WorkingSetMiB": 35.805,
+      "PrivateBytesMiB": 7.383
+    }
+  ],
+  "BaselineContext": {
+    "MeasurementKind": "Pre-optimization baseline of the already-running instance",
+    "InterfaceState": "Not controlled or changed by the measurement; visibility, window contents, and interaction state were not inspected",
+    "OptimizedBuildRun": false,
+    "Interpretation": "The newer build was not launched. These values are not post-optimization results and must not be used as evidence of an optimization improvement."
+  }
+}
